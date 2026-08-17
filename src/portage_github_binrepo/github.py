@@ -252,11 +252,6 @@ For setup and maintenance instructions, refer to the
     def check(self, write: bool = True, branch: str = BINREPO_BRANCH) -> dict[str, Any]:
         branch = validate_branch(branch)
         repository = self.repository_data()
-        permissions = repository.get("permissions", {})
-        if not permissions.get("pull"):
-            raise GitHubError(f"token cannot read repository: {self.repository}")  # noqa: TRY003
-        if write and not permissions.get("push"):
-            raise GitHubError(f"token cannot write repository: {self.repository}")  # noqa: TRY003
         default_branch = repository["default_branch"]
         ref = self.get_ref(f"heads/{branch}")
         initialized = bool(ref)

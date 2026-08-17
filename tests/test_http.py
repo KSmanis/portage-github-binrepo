@@ -69,16 +69,11 @@ def test_pagination_follows_link_header(http: responses.RequestsMock) -> None:
     assert http.calls[1].request.url == second
 
 
-def test_check_uses_repository_permissions_without_user_request(
+def test_check_accepts_repository_without_user_permissions(
     http: responses.RequestsMock,
 ) -> None:
     http.get(
-        f"{API}/repos/owner/repo",
-        json={
-            "private": True,
-            "default_branch": "main",
-            "permissions": {"pull": True, "push": True},
-        },
+        f"{API}/repos/owner/repo", json={"private": True, "default_branch": "main"}
     )
     http.get(
         f"{API}/repos/owner/repo/git/ref/heads/binrepo",
@@ -115,12 +110,7 @@ def test_empty_repository_ref_is_uninitialized(http: responses.RequestsMock) -> 
 
 def test_check_accepts_empty_repository(http: responses.RequestsMock) -> None:
     http.get(
-        f"{API}/repos/owner/repo",
-        json={
-            "private": True,
-            "default_branch": "main",
-            "permissions": {"pull": True, "push": True},
-        },
+        f"{API}/repos/owner/repo", json={"private": True, "default_branch": "main"}
     )
     http.get(f"{API}/repos/owner/repo/git/ref/heads/binrepo", json={}, status=409)
     client = github.GitHubClient("owner/repo", "secret")
