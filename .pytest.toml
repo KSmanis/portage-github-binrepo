@@ -1,0 +1,12 @@
+[pytest]
+addopts = [
+  "--cov-report=term",
+  "--cov-report=xml",
+  "--cov=src",
+  "--import-mode=importlib",
+]
+markers = [
+  "live: creates and deletes a private GitHub repository",
+]
+strict = true
+testpaths = ["tests"]

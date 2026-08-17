@@ -1,0 +1,51 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatch-vcs", "hatchling"]
+
+[dependency-groups]
+lint = [
+  "deptry>=0.25.1",
+  "prek>=0.4.11",
+]
+release = [
+  "python-semantic-release>=10.6.1",
+]
+test = [
+  "inline-snapshot>=0.35.3",
+  "pytest-cov>=7.1.0",
+  "pytest-randomly>=4.1.0",
+  "pytest>=9.1.1",
+  "responses>=0.26.2",
+]
+type = [
+  "ty>=0.0.65",
+]
+
+[project]
+dependencies = [
+  "portage>=3.0.81.1",
+  "requests>=2.34.2",
+]
+description = "Host a Portage binrepo in GitHub"
+dynamic = ["version"]
+license = "MIT"
+license-files = ["LICENSE"]
+name = "portage-github-binrepo"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[project.scripts]
+portage-github-binrepo = "portage_github_binrepo.cli:main"
+
+[tool.deptry]
+known_first_party = ["portage_github_binrepo"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.inline-snapshot]
+format-command = "scripts/inline-snapshot-format {filename}"
+
+[tool.uv]
+default-groups = "all"
+exclude-newer = "7 days"

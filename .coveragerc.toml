@@ -1,0 +1,16 @@
+[report]
+exclude_also = [
+  '@(t(yping)?\.)?overload',
+  'case _ as unreachable:',
+  'class .+\(.*\b(t(yping)?\.)?Protocol\b.*\):',
+  'if (t(yping)?\.)?TYPE_CHECKING:',
+  'raise NotImplementedError',
+  'raise UnreachableError',
+]
+show_missing = true
+skip_covered = true
+skip_empty = true
+
+[run]
+branch = true
+relative_files = true

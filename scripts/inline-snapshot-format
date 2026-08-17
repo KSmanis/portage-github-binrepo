@@ -1,0 +1,9 @@
+#!/bin/sh
+set -efu
+
+tmpdir="$(mktemp -d -t inline-snapshot.XXXXXXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+filename="$tmpdir/$1"
+cat >"$filename"
+uv run prek --files "$filename" >/dev/null 2>&1 || :
+cat "$filename"

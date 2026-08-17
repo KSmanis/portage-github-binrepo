@@ -1,0 +1,4 @@
+# Normalize text files in case core.autocrlf is not configured.
+* text=auto
+*.bashrc text eol=lf
+*.sh text eol=lf

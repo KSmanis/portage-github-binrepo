@@ -1,0 +1,28 @@
+#!/bin/sh
+set -efu
+
+cd "$(git rev-parse --show-toplevel)"
+
+sync_inputs_changed() {
+  ! git diff --quiet "$@" -- ':(glob,top)**/pyproject.toml' ':(glob,top)**/uv.lock'
+}
+
+if [ -n "${PRE_COMMIT_CHECKOUT_TYPE-}" ]; then
+  if [ "${PRE_COMMIT_CHECKOUT_TYPE-}" = 0 ]; then
+    sync_inputs_changed HEAD || exit 0
+  else
+    sync_inputs_changed "$PRE_COMMIT_FROM_REF" "$PRE_COMMIT_TO_REF" || exit 0
+  fi
+elif [ "${PRE_COMMIT_SQUASH_MERGE-}" = 1 ]; then
+  sync_inputs_changed --cached || exit 0
+elif [ -n "${PRE_COMMIT_REWRITE_COMMAND-}" ]; then
+  if [ "$PRE_COMMIT_REWRITE_COMMAND" = rebase ]; then
+    sync_inputs_changed ORIG_HEAD HEAD || exit 0
+  else
+    sync_inputs_changed 'HEAD@{1}' HEAD || exit 0
+  fi
+elif [ -n "${PRE_COMMIT-}" ]; then
+  sync_inputs_changed ORIG_HEAD HEAD || exit 0
+fi
+
+uv --color=always sync --all-extras --frozen

@@ -1,0 +1,146 @@
+default_install_hook_types:
+  - commit-msg
+  - post-checkout
+  - post-merge
+  - post-rewrite
+  - pre-commit
+exclude:
+  glob:
+    - "**/uv.lock"
+repos:
+  # Meta
+  - repo: meta
+    hooks:
+      - id: check-hooks-apply
+        priority: &read-only 1000
+      - id: check-useless-excludes
+        priority: *read-only
+  # Builtin
+  - repo: builtin
+    hooks:
+      - id: check-executables-have-shebangs
+        priority: *read-only
+      - id: check-merge-conflict
+        args: ["--assume-in-merge"]
+        priority: *read-only
+      - id: check-shebang-scripts-are-executable
+        priority: *read-only
+      - id: end-of-file-fixer
+        priority: &write-serial null
+      - id: trailing-whitespace
+        priority: *write-serial
+  - repo: https://github.com/renovatebot/pre-commit-hooks
+    rev: 43.281.1
+    hooks:
+      - id: renovate-config-validator
+        args: ["--strict"]
+        priority: *read-only
+  # Git
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        priority: *read-only
+  - repo: https://github.com/jorisroovers/gitlint
+    rev: v0.19.1
+    hooks:
+      - id: gitlint
+        priority: *read-only
+      - id: gitlint-ci
+  # GitHub Actions
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.37.4
+    hooks:
+      - id: check-github-workflows
+        priority: *read-only
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        priority: *read-only
+  # JSON
+  - repo: builtin
+    hooks:
+      - id: pretty-format-json
+        args: ["--autofix", "--no-ensure-ascii"]
+        priority: &write-parallel 999
+      - id: check-json
+        priority: *read-only
+  # Markdown
+  - repo: https://github.com/rvben/rumdl-pre-commit
+    rev: v0.2.48
+    hooks:
+      - id: rumdl
+        args: ["--fix"]
+        priority: *write-parallel
+  # Python
+  - repo: local
+    hooks:
+      - id: uv-sync
+        name: uv-sync
+        language: system
+        entry: scripts/sync
+        always_run: true
+        pass_filenames: false
+        priority: *read-only
+        stages: ["post-checkout", "post-merge", "post-rewrite"]
+      - id: deptry
+        name: deptry
+        language: system
+        entry: uv run deptry .
+        pass_filenames: false
+        priority: *read-only
+        files:
+          glob:
+            - "**/*.py"
+            - "pyproject.toml"
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.12.1
+    hooks:
+      - id: uv-lock
+        priority: *read-only
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      - id: ruff-check
+        args: ["--fix"]
+        priority: *write-serial
+      - id: ruff-format
+        priority: *write-serial
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty
+        language: system
+        entry: .venv/bin/ty check --fix --venv=.venv
+        pass_filenames: false
+        priority: *write-serial
+        types: ["python"]
+  # Shell
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        priority: *read-only
+  # TOML
+  - repo: https://github.com/pappasam/toml-sort
+    rev: v0.24.4
+    hooks:
+      - id: toml-sort-fix
+        args: ["--all", "--in-place", "--trailing-comma-inline-array"]
+        priority: *write-parallel
+  - repo: builtin
+    hooks:
+      - id: check-toml
+        priority: *read-only
+  # YAML
+  - repo: https://github.com/google/yamlfmt
+    rev: v0.21.0
+    hooks:
+      - id: yamlfmt
+        priority: *write-parallel
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        priority: *read-only

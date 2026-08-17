@@ -1,0 +1,41 @@
+name: release
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+concurrency:
+  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+jobs:
+  release:
+    env:
+      FORCE_COLOR: 1
+      UV_FROZEN: 1
+      UV_NO_SYNC: 1
+      UV_PYTHON_PREFERENCE: only-managed
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Install dependencies
+        run: uv sync --only-group release
+      - name: Detect release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "tag=$(uv run semantic-release version --print-tag)" >> "$GITHUB_OUTPUT"
+      - name: Create release
+        if: steps.release.outputs.tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          uv run semantic-release version --no-changelog --no-commit --push --skip-build
+          uv build
+          uv run semantic-release publish --tag '${{ steps.release.outputs.tag }}'

@@ -1,0 +1,49 @@
+name: lint-pr-title
+on:
+  pull_request:
+    types: [edited, opened, reopened, synchronize]
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+jobs:
+  lint-pr-title:
+    env:
+      FORCE_COLOR: 1
+      PREK_COLOR: always
+      UV_FROZEN: 1
+      UV_NO_SYNC: 1
+      UV_PYTHON_PREFERENCE: only-managed
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Install Python dependencies
+        run: uv sync --only-group lint
+      - name: Identify Python version
+        id: identify-python
+        run: echo "python-version=$(uv run python -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Cache prek hooks
+        id: cache-prek-hooks
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/prek
+          key: prek|${{ steps.identify-python.outputs.python-version }}|${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            prek|${{ steps.identify-python.outputs.python-version }}|
+            prek|
+      - name: Prune prek hooks
+        if: steps.cache-prek-hooks.outputs.cache-hit != 'true'
+        run: uv run prek gc
+      - name: Create dummy commit from PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          git config user.name '${{ github.event.pull_request.user.login }}'
+          git config user.email '${{ github.event.pull_request.user.id }}+${{ github.event.pull_request.user.login }}@users.noreply.github.com'
+          git commit --allow-empty -m "${PR_TITLE}"
+      - name: Run gitlint
+        run: uv run prek run --hook-stage manual gitlint-ci
