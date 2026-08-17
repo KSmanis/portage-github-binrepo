@@ -251,7 +251,6 @@ For setup and maintenance instructions, refer to the
 
     def check(self, write: bool = True, branch: str = BINREPO_BRANCH) -> dict[str, Any]:
         branch = validate_branch(branch)
-        user = self.authenticated_user()
         repository = self.repository_data()
         permissions = repository.get("permissions", {})
         if not permissions.get("pull"):
@@ -262,7 +261,6 @@ For setup and maintenance instructions, refer to the
         ref = self.get_ref(f"heads/{branch}")
         initialized = bool(ref)
         return {
-            "login": user["login"],
             "private": repository["private"],
             "default_branch": default_branch,
             "access": "write" if write else "read",

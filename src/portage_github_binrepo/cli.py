@@ -133,9 +133,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "check":
             result = check_repository(client, read_only=args.read_only, branch=branch)
             print(
-                f"repository={repository} authenticated_as={result['login']} "
-                f"access={result['access']} private={str(result['private']).lower()} "
-                f"default_branch={result['default_branch']}"
+                f"repository={repository}"
+                f" access={result['access']}"
+                f" private={str(result['private']).lower()}"
+                f" default_branch={result['default_branch']}"
             )
         elif args.command == "push":
             settings = config()

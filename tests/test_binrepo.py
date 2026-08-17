@@ -92,7 +92,6 @@ class FakeClient:
         self.checks.append(write)
         self.check_branches.append(branch)
         return {
-            "login": "owner",
             "private": True,
             "default_branch": "main",
             "access": "write" if write else "read",
@@ -712,7 +711,7 @@ def test_token_file_must_be_private(tmp_path: Path) -> None:
 
 
 def test_cli_uses_global_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("secret\n", encoding="utf-8")
@@ -726,7 +725,6 @@ def test_cli_uses_global_config(
     )
     client = Mock()
     client.check.return_value = {
-        "login": "owner",
         "private": True,
         "default_branch": "main",
         "access": "read",
@@ -740,6 +738,9 @@ def test_cli_uses_global_config(
 
     make_client.assert_called_once_with("owner/repo", "secret")
     client.check.assert_called_once_with(write=False, branch="testing")
+    assert capsys.readouterr().out == snapshot(
+        "repository=owner/repo access=read private=true default_branch=main\n"
+    )
 
 
 def test_config_rejects_unknown_key(tmp_path: Path) -> None:
@@ -978,7 +979,6 @@ def test_init_creates_private_repository() -> None:
     client = Mock()
     client.get_repository.return_value = None
     client.check.return_value = {
-        "login": "owner",
         "private": True,
         "default_branch": "main",
         "access": "write",
@@ -993,7 +993,6 @@ def test_init_accepts_empty_existing_repository() -> None:
     client = Mock()
     client.get_repository.return_value = {"name": "repo"}
     client.check.return_value = {
-        "login": "owner",
         "private": True,
         "default_branch": "main",
         "access": "write",

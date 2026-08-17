@@ -69,8 +69,9 @@ def test_pagination_follows_link_header(http: responses.RequestsMock) -> None:
     assert http.calls[1].request.url == second
 
 
-def test_check_checks_authenticated_write_access(http: responses.RequestsMock) -> None:
-    http.get(f"{API}/user", json={"login": "owner"})
+def test_check_uses_repository_permissions_without_user_request(
+    http: responses.RequestsMock,
+) -> None:
     http.get(
         f"{API}/repos/owner/repo",
         json={
@@ -87,12 +88,17 @@ def test_check_checks_authenticated_write_access(http: responses.RequestsMock) -
 
     assert client.check() == snapshot(
         {
-            "login": "owner",
             "private": True,
             "default_branch": "main",
             "access": "write",
             "initialized": True,
         }
+    )
+    assert [call.request.url for call in http.calls] == snapshot(
+        [
+            "https://api.github.com/repos/owner/repo",
+            "https://api.github.com/repos/owner/repo/git/ref/heads/binrepo",
+        ]
     )
 
 
@@ -108,7 +114,6 @@ def test_empty_repository_ref_is_uninitialized(http: responses.RequestsMock) -> 
 
 
 def test_check_accepts_empty_repository(http: responses.RequestsMock) -> None:
-    http.get(f"{API}/user", json={"login": "owner"})
     http.get(
         f"{API}/repos/owner/repo",
         json={
