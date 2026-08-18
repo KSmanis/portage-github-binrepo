@@ -9,6 +9,21 @@ Host Portage binrepos in GitHub infrastructure. Inspired by
 - Publish packages from a builder machine automatically or manually
 - Use the packages on multiple client machines
 
+## Under the hood
+
+This repo is a Python CLI that interacts with the Portage and GitHub APIs in
+order to allow syncing local binary packages to a GitHub repository and vice
+versa.
+
+Specifically, the `push` command mirrors the contents of the local `PKGDIR` to
+the GitHub repository as follows:
+
+- The `Packages` index is pushed to a git branch (`binrepo` by default)
+- Every binary package is uploaded as an asset to a unique GitHub Release
+
+The `pull` command mirrors the contents of the GitHub repository to the local
+`PKGDIR`.
+
 ## Usage
 
 ### Builder machine
