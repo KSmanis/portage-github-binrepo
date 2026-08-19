@@ -1,4 +1,5 @@
 import base64
+import errno
 import gzip
 import hashlib
 from collections.abc import Iterator
@@ -1033,6 +1034,29 @@ def test_pull_all_replaces_local_cache_with_remote(tmp_path: Path) -> None:
     assert not (tmp_path / "Packages.gz").exists()
     client.check.assert_called_once_with(write=False, branch="binrepo")
     client.get_content.assert_called_once_with("Packages", "binrepo")
+
+
+def test_replace_cache_copies_across_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pkgdir = tmp_path / "pkgdir"
+    staging = tmp_path / "staging"
+    package = staging / "cat/pkg/pkg-1.gpkg.tar"
+    package.parent.mkdir(parents=True)
+    package.write_bytes(b"package")
+    (staging / "Packages").write_bytes(b"index")
+    pkgdir.mkdir()
+
+    def cross_device_replace(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(Path, "replace", cross_device_replace)
+
+    pull._replace_cache(pkgdir, staging)
+
+    assert (pkgdir / "cat/pkg/pkg-1.gpkg.tar").read_bytes() == b"package"
+    assert (pkgdir / "Packages").read_bytes() == b"index"
+    assert not package.exists()
 
 
 @pytest.mark.parametrize("repository", ("download/repo", "owner/download"))

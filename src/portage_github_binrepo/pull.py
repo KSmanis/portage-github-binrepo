@@ -1,6 +1,8 @@
 """Pull binrepo indexes and assets from GitHub."""
 
+import errno
 import gzip
+import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import unquote
@@ -144,7 +146,13 @@ def _replace_cache(pkgdir: Path, staging: Path) -> None:
         if source.is_file():
             destination = pkgdir / source.relative_to(staging)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source.replace(destination)
+            try:
+                source.replace(destination)
+            except OSError as error:
+                if error.errno != errno.EXDEV:
+                    raise
+                shutil.copy2(source, destination)
+                source.unlink()
 
 
 def repository_from_uri(uri: str) -> str:
