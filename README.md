@@ -19,7 +19,9 @@ Specifically, the `push` command mirrors the contents of the local `PKGDIR` to
 the GitHub repository as follows:
 
 - The `Packages` index is pushed to a git branch (`binrepo` by default)
-- Every binary package is uploaded as an asset to a unique GitHub Release
+- Binary packages are uploaded as assets into sharded GitHub releases
+  (`binrepo/<N>` by default), each containing up to 1000 assets/packages
+  according to GitHub's limits
 
 The `pull` command mirrors the contents of the GitHub repository to the local
 `PKGDIR`.

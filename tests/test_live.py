@@ -3,7 +3,6 @@ import secrets
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Never
 
 import pytest
 import requests
@@ -14,8 +13,22 @@ from portage_github_binrepo import init as init_module
 from portage_github_binrepo import package
 from portage_github_binrepo import pull
 from portage_github_binrepo import push
-from tests.test_binrepo import make_packages
 from tests.test_binrepo import write_pkgdir
+
+
+def representative_packages(
+    entries: list[tuple[str, str, str, bytes]],
+) -> tuple[str, dict[str, bytes]]:
+    stanzas = [
+        "\n".join(
+            (f"CPV: {cpv}", f"CHOST: {chost}", f"PATH: {path}", f"SIZE: {len(content)}")
+        )
+        for path, cpv, chost, content in entries
+    ]
+    return (
+        "\n\n".join((f"PACKAGES: {len(entries)}", *stanzas)) + "\n\n",
+        {path: content for path, _, _, content in entries},
+    )
 
 
 @pytest.mark.live
@@ -59,23 +72,58 @@ def test_private_repository_round_trip(tmp_path: Path) -> None:
         assert init["created"] is expected_created
         assert init["private"] is True
         assert client.check(write=True)["access"] == "write"
-        suffix = secrets.token_hex(4)
-        chost = f"x86_64-pc-linux-gnu-{suffix}"
-        first = "cat/one/one-1-1.gpkg.tar"
-        first_content = b"first"
-        write_pkgdir(
-            tmp_path,
-            make_packages(first, sizes={first: len(first_content)}, chost=chost),
-            {first: first_content},
-        )
 
-        assert push.push(client, tmp_path)["uploaded"] == 1
+        suffix = secrets.token_hex(4)
+        entries = [
+            (
+                "x86_64/sys-apps/portage/portage-3.0.81-r1-1.gpkg.tar",
+                "sys-apps/portage-3.0.81-r1",
+                f"x86_64-pc-linux-gnu-{suffix}",
+                b"representative amd64 gpkg",
+            ),
+            (
+                "arm64/dev-lang/python-3.14.0-r1.gpkg.tar",
+                "dev-lang/python-3.14.0-r1",
+                f"aarch64-unknown-linux-gnu-{suffix}",
+                b"representative arm64 flat gpkg",
+            ),
+            (
+                "x86/sys-libs/zlib-1.3.1-r1.tbz2",
+                "sys-libs/zlib-1.3.1-r1",
+                f"i686-pc-linux-gnu-{suffix}",
+                b"representative xpak",
+            ),
+        ]
+        packages, files = representative_packages(entries)
+        write_pkgdir(tmp_path, packages, files)
+
+        assert push.push(client, tmp_path) == {
+            "uploaded": 3,
+            "removed": 0,
+            "unchanged": 0,
+        }
         branch = github.BINREPO_BRANCH
-        assert client.get_content("Packages", branch)
-        first_tag, first_name = package.release_coordinates(f"{branch}/{chost}/{first}")
-        release = client.get_release(first_tag)
+        remote_content = client.get_content("Packages", branch)
+        assert remote_content is not None
+        remote_text = client.content_bytes(remote_content).decode()
+        remote_entries = package.parse_packages(remote_text)
+        assert len(remote_entries) == 3
+        assert {
+            package.release_coordinates(path, branch)[0] for path in remote_entries
+        } == {"binrepo/0"}
+        assert (
+            len(
+                {
+                    package.remote_ids(metadata, package.asset_ids(remote_text))[1]
+                    for metadata in remote_entries.values()
+                }
+            )
+            == 3
+        )
+        release = client.get_release("binrepo/0")
         assert release
-        assert release["tag_name"] == first_tag
+        assert release["target_commitish"] == branch
+        assert all("__" in Path(path).name for path in remote_entries)
 
         pulled_index = tmp_path / "pulled-Packages"
         pull.pull(
@@ -83,47 +131,45 @@ def test_private_repository_round_trip(tmp_path: Path) -> None:
             f"https://raw.githubusercontent.com/{repository}/{branch}/Packages",
             pulled_index,
         )
-        first_remote_path = f"{first_tag}/{first_name}"
-        assert f"PATH: {first_remote_path}" in pulled_index.read_text(encoding="utf-8")
-        pulled_asset = tmp_path / "pulled-asset"
-        pull.pull(
-            client,
-            f"https://github.com/{repository}/releases/download/{first_tag}/{first_name}",
-            pulled_asset,
-        )
-        assert pulled_asset.read_bytes() == b"first"
+        pulled_text = pulled_index.read_text(encoding="utf-8")
+        for remote_path, metadata in remote_entries.items():
+            local_path = metadata[package.LOCAL_PATH_FIELD]
+            destination = tmp_path / "individual" / local_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            pull.pull(
+                client,
+                f"https://github.com/{repository}/releases/download/{remote_path}",
+                destination,
+                pulled_text,
+            )
+            assert destination.read_bytes() == files[local_path]
 
-        second = "cat/two/two-1-1.gpkg.tar"
-        second_content = b"second"
-        write_pkgdir(
-            tmp_path,
-            make_packages(second, sizes={second: len(second_content)}, chost=chost),
-            {second: second_content},
-        )
-        second_tag, second_name = package.release_coordinates(
-            f"{branch}/{chost}/{second}"
-        )
+        mirror = tmp_path / "mirror"
+        pull.pull_all(client, mirror)
+        for local_path, content in files.items():
+            assert (mirror / local_path).read_bytes() == content
 
+        updated = b"updated arm64 package"
+        entries[1] = (*entries[1][:3], updated)
+        packages, files = representative_packages(entries)
+        write_pkgdir(tmp_path, packages, files)
         assert push.push(client, tmp_path) == {
             "uploaded": 1,
-            "removed": 1,
-            "unchanged": 0,
+            "removed": 0,
+            "unchanged": 2,
         }
-        assert client.get_release(first_tag) is None
-        assert client.get_release(second_tag) is not None
+        assert len(client.list_assets(release["id"])) == 3
 
-        updated_content = b"updated after uncertain index write"
-        write_pkgdir(
-            tmp_path,
-            make_packages(second, sizes={second: len(updated_content)}, chost=chost),
-            {second: updated_content},
-        )
+        uncertain = b"updated after uncertain index write"
+        entries[2] = (*entries[2][:3], uncertain)
+        packages, files = representative_packages(entries)
+        write_pkgdir(tmp_path, packages, files)
         put_content = client.put_content
         lose_response = True
 
         def apply_then_fail(
             path: str, branch: str, content: bytes, message: str, sha: str | None = None
-        ) -> object:
+        ) -> github.ContentUpdate:
             nonlocal lose_response
             result = put_content(path, branch, content, message, sha)
             if lose_response:
@@ -137,117 +183,41 @@ def test_private_repository_round_trip(tmp_path: Path) -> None:
         finally:
             object.__setattr__(client, "put_content", put_content)
 
-        pull.pull(
-            client,
-            f"https://github.com/{repository}/releases/download/{second_tag}/{second_name}",
-            pulled_asset,
-        )
-        assert pulled_asset.read_bytes() == updated_content
-        index = client.get_content("Packages", branch)
-        assert package.CLEANUP_FIELD not in client.content_bytes(index).decode()
-
-        rejected_content = b"upload must be rolled back"
-        write_pkgdir(
-            tmp_path,
-            make_packages(second, sizes={second: len(rejected_content)}, chost=chost),
-            {second: rejected_content},
-        )
-        upload_asset = client.upload_asset
-        list_assets = client.list_assets
-        asset_list_count = 0
-
-        def fail_upload(*_args: object, **_kwargs: object) -> Never:
-            raise github.GitHubError("simulated upload failure")  # noqa: TRY003
-
-        def fail_upload_reconciliation(release_id: int) -> list[object]:
-            nonlocal asset_list_count
-            asset_list_count += 1
-            if asset_list_count == 2:
-                raise github.GitHubError("simulated reconciliation failure")  # noqa: TRY003
-            return list_assets(release_id)
-
-        object.__setattr__(client, "upload_asset", fail_upload)
-        object.__setattr__(client, "list_assets", fail_upload_reconciliation)
-        try:
-            with pytest.raises(
-                github.GitHubError, match="simulated reconciliation failure"
-            ):
-                push.push(client, tmp_path)
-        finally:
-            object.__setattr__(client, "upload_asset", upload_asset)
-            object.__setattr__(client, "list_assets", list_assets)
-
-        pull.pull(
-            client,
-            f"https://github.com/{repository}/releases/download/{second_tag}/{second_name}",
-            pulled_asset,
-        )
-        assert pulled_asset.read_bytes() == updated_content
-
-        final_content = b"cleanup resumes"
-        write_pkgdir(
-            tmp_path,
-            make_packages(second, sizes={second: len(final_content)}, chost=chost),
-            {second: final_content},
-        )
+        cleanup_content = b"cleanup resumes by stored asset id"
+        entries[0] = (*entries[0][:3], cleanup_content)
+        packages, files = representative_packages(entries)
+        write_pkgdir(tmp_path, packages, files)
         delete_asset = client.delete_asset
         fail_cleanup = True
 
-        def fail_backup_cleanup(asset_id: int) -> object:
+        def fail_asset_cleanup(asset_id: int) -> None:
             nonlocal fail_cleanup
             if fail_cleanup:
                 fail_cleanup = False
                 raise github.GitHubError("simulated cleanup failure")  # noqa: TRY003
-            return delete_asset(asset_id)
+            delete_asset(asset_id)
 
-        object.__setattr__(client, "delete_asset", fail_backup_cleanup)
+        object.__setattr__(client, "delete_asset", fail_asset_cleanup)
         try:
             with pytest.raises(github.GitHubError, match="simulated cleanup failure"):
                 push.push(client, tmp_path)
         finally:
             object.__setattr__(client, "delete_asset", delete_asset)
-
         index = client.get_content("Packages", branch)
+        assert index is not None
         assert package.CLEANUP_FIELD in client.content_bytes(index).decode()
         assert push.push(client, tmp_path) == {
             "uploaded": 0,
             "removed": 0,
-            "unchanged": 1,
+            "unchanged": 3,
         }
         index = client.get_content("Packages", branch)
+        assert index is not None
         assert package.CLEANUP_FIELD not in client.content_bytes(index).decode()
 
-        write_pkgdir(tmp_path, make_packages(), {})
-        delete_ref = client.delete_ref
-        fail_cleanup = True
-
-        def apply_ref_delete_then_fail(ref: str) -> object:
-            nonlocal fail_cleanup
-            result = delete_ref(ref)
-            if fail_cleanup:
-                fail_cleanup = False
-                raise github.GitHubError("simulated tag cleanup failure")  # noqa: TRY003
-            return result
-
-        object.__setattr__(client, "delete_ref", apply_ref_delete_then_fail)
-        try:
-            with pytest.raises(
-                github.GitHubError, match="simulated tag cleanup failure"
-            ):
-                push.push(client, tmp_path)
-        finally:
-            object.__setattr__(client, "delete_ref", delete_ref)
-
-        index = client.get_content("Packages", branch)
-        assert package.CLEANUP_FIELD in client.content_bytes(index).decode()
-        assert push.push(client, tmp_path) == {
-            "uploaded": 0,
-            "removed": 0,
-            "unchanged": 0,
-        }
-        assert client.get_release(second_tag) is None
-        index = client.get_content("Packages", branch)
-        assert package.CLEANUP_FIELD not in client.content_bytes(index).decode()
+        write_pkgdir(tmp_path, "PACKAGES: 0\n\n", {})
+        assert push.push(client, tmp_path)["removed"] == 3
+        assert client.get_release("binrepo/0") is None
     finally:
         if repository:
             if keep_repository:

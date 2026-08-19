@@ -5,10 +5,13 @@ import re
 import time
 from collections.abc import Callable
 from collections.abc import Iterable
-from collections.abc import Iterator
 from collections.abc import Mapping
+from io import BufferedReader
 from pathlib import Path
-from typing import Any
+from typing import Literal
+from typing import Protocol
+from typing import TypedDict
+from typing import Unpack
 from urllib.parse import quote
 
 import requests
@@ -29,13 +32,127 @@ class GitHubError(RuntimeError):
     pass
 
 
+class Repository(TypedDict):
+    default_branch: str
+    private: bool
+
+
+class User(TypedDict):
+    login: str
+
+
+class CheckResult(TypedDict):
+    private: bool
+    default_branch: str
+    access: Literal["read", "write"]
+    initialized: bool
+
+
+class GitObject(TypedDict):
+    sha: str
+
+
+class GitRef(TypedDict, total=False):
+    ref: str
+    object: GitObject
+
+
+class Content(TypedDict, total=False):
+    content: str
+    encoding: str
+    git_url: str
+    sha: str
+
+
+class ContentUpdate(TypedDict):
+    content: Content
+
+
+class Blob(TypedDict):
+    content: str
+    encoding: str
+
+
+class Release(TypedDict, total=False):
+    id: int
+    target_commitish: str
+    tag_name: str
+    name: str
+    body: str
+    upload_url: str
+
+
+class Asset(TypedDict, total=False):
+    id: int
+    name: str
+    size: int
+
+
+type JSONValue = (
+    bool | int | float | str | list[JSONValue] | dict[str, JSONValue] | None
+)
+
+
+class RequestOptions(TypedDict, total=False):
+    data: BufferedReader
+    headers: Mapping[str, str]
+    json: JSONValue
+    params: Mapping[str, str]
+    stream: bool
+
+
+class CheckAPI(Protocol):
+    def check(
+        self, write: bool = True, branch: str = BINREPO_BRANCH
+    ) -> CheckResult: ...
+
+
+class InitAPI(CheckAPI, Protocol):
+    def get_repository(self) -> Repository | None: ...
+    def create_repository(self, private: bool = True) -> Repository: ...
+
+
+class PullAPI(CheckAPI, Protocol):
+    repository: str
+
+    def get_ref(self, ref: str) -> GitRef | None: ...
+    def get_content(self, path: str, ref: str) -> Content | None: ...
+    def content_bytes(self, content: Content) -> bytes: ...
+    def download_asset(self, asset_id: int, destination: Path) -> None: ...
+
+
+class PushAPI(CheckAPI, Protocol):
+    repository: str
+
+    def initialize_repository(
+        self, default_branch: str, branch: str = BINREPO_BRANCH
+    ) -> GitRef: ...
+    def delete_ref(self, ref: str) -> None: ...
+    def get_content(self, path: str, ref: str) -> Content | None: ...
+    def content_bytes(self, content: Content) -> bytes: ...
+    def put_content(
+        self,
+        path: str,
+        branch: str,
+        content: bytes,
+        message: str,
+        sha: str | None = None,
+    ) -> ContentUpdate: ...
+    def get_release(self, tag: str) -> Release | None: ...
+    def create_release(self, tag: str, branch: str) -> Release: ...
+    def list_assets(self, release_id: int) -> list[Asset]: ...
+    def upload_asset(self, release_id: int, path: Path, name: str) -> Asset: ...
+    def delete_asset(self, asset_id: int) -> None: ...
+    def delete_release(self, release_id: int) -> None: ...
+
+
 class GitHubClient:
     def __init__(
         self,
         repository: str,
         token: str,
-        session: Any = None,  # noqa: ANN401
-        sleep: Callable[[float], Any] = time.sleep,
+        session: requests.Session | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         try:
             owner, repo = repository.split("/", 1)
@@ -64,15 +181,14 @@ class GitHubClient:
         *,
         expected: tuple[int, ...] = (200,),
         retries: int = 3,
-        **kwargs: Any,
-    ) -> Any:  # noqa: ANN401
+        timeout: float | tuple[float, float] = (10, 300),
+        **kwargs: Unpack[RequestOptions],
+    ) -> requests.Response:
         if url.startswith("/"):
             url = f"https://api.github.com{url}"
         for attempt in range(retries + 1):
             try:
-                response = self.session.request(
-                    method, url, timeout=kwargs.pop("timeout", (10, 300)), **kwargs
-                )
+                response = self.session.request(method, url, timeout=timeout, **kwargs)
             except requests.RequestException as error:
                 if attempt == retries or method not in {"GET", "HEAD"}:
                     raise GitHubError(  # noqa: TRY003
@@ -103,43 +219,28 @@ class GitHubClient:
             )
         raise AssertionError("unreachable")
 
-    def json(
+    def json[T](
         self,
         method: str,
         path: str,
         *,
         expected: tuple[int, ...] = (200,),
-        **kwargs: Any,
-    ) -> Any:  # noqa: ANN401
+        **kwargs: Unpack[RequestOptions],
+    ) -> T:
         response = self.request(method, path, expected=expected, **kwargs)
         if not response.content:
-            return None
+            raise GitHubError("GitHub returned an empty JSON response")  # noqa: TRY003
         return response.json()
 
-    def paginate(self, path: str) -> Iterator[Any]:
-        url = path
-        while url:
-            response = self.request("GET", url)
-            yield from response.json()
-            url = response.links.get("next", {}).get("url")
-
-    def repository_data(self) -> Any:  # noqa: ANN401
-        repository = self.get_repository()
-        if not repository:
-            raise GitHubError(  # noqa: TRY003
-                f"repository is missing or inaccessible: {self.repository}"
-            )
+    def get_repository(self) -> Repository | None:
+        response = self.request("GET", self._repo_path(), expected=(200, 404))
+        if response.status_code == 404:
+            return None
+        repository: Repository = response.json()
         return repository
 
-    def authenticated_user(self) -> Any:  # noqa: ANN401
-        return self.json("GET", "/user")
-
-    def get_repository(self) -> Any:  # noqa: ANN401
-        response = self.request("GET", self._repo_path(), expected=(200, 404))
-        return None if response.status_code == 404 else response.json()
-
-    def create_repository(self, private: bool = True) -> Any:  # noqa: ANN401
-        user = self.authenticated_user()
+    def create_repository(self, private: bool = True) -> Repository:
+        user: User = self.json("GET", "/user")
         if user["login"].casefold() == self.owner.casefold():
             path = "/user/repos"
         else:
@@ -159,7 +260,7 @@ class GitHubClient:
 
     def initialize_repository(
         self, default_branch: str, branch: str = BINREPO_BRANCH
-    ) -> Any:  # noqa: ANN401
+    ) -> GitRef:
         branch = validate_branch(branch)
         readme = f"""# {self.repo}
 
@@ -168,7 +269,7 @@ Portage binary package repository maintained by
 
 A portage hook updates this repository after every successful package merge.
 Binary packages are stored as GitHub Release assets under
-`{branch}/<CHOST>/<category>/<package>` tags. The package index is stored on the
+`{branch}/<shard>` tags. The package index is stored on the
 [`{branch}`](https://github.com/{self.repository}/tree/{branch}) branch.
 
 ## Usage
@@ -212,7 +313,7 @@ For setup and maintenance instructions, refer to the
             except GitHubError:
                 if not self.get_ref(f"heads/{default_branch}"):
                     raise
-        tree = self.json(
+        tree: GitObject = self.json(
             "POST",
             f"{self._repo_path()}/git/trees",
             expected=(201,),
@@ -228,7 +329,7 @@ For setup and maintenance instructions, refer to the
                 ]
             },
         )
-        commit = self.json(
+        commit: GitObject = self.json(
             "POST",
             f"{self._repo_path()}/git/commits",
             expected=(201,),
@@ -249,9 +350,13 @@ For setup and maintenance instructions, refer to the
                 return ref
             raise
 
-    def check(self, write: bool = True, branch: str = BINREPO_BRANCH) -> dict[str, Any]:
+    def check(self, write: bool = True, branch: str = BINREPO_BRANCH) -> CheckResult:
         branch = validate_branch(branch)
-        repository = self.repository_data()
+        repository = self.get_repository()
+        if not repository:
+            raise GitHubError(  # noqa: TRY003
+                f"repository is missing or inaccessible: {self.repository}"
+            )
         default_branch = repository["default_branch"]
         ref = self.get_ref(f"heads/{branch}")
         initialized = bool(ref)
@@ -262,13 +367,16 @@ For setup and maintenance instructions, refer to the
             "initialized": initialized,
         }
 
-    def get_ref(self, ref: str) -> Any:  # noqa: ANN401
+    def get_ref(self, ref: str) -> GitRef | None:
         response = self.request(
             "GET",
             f"{self._repo_path()}/git/ref/{quote(ref, safe='/')}",
             expected=(200, 404, 409),
         )
-        return None if response.status_code in {404, 409} else response.json()
+        if response.status_code in {404, 409}:
+            return None
+        result: GitRef = response.json()
+        return result
 
     def delete_ref(self, ref: str) -> None:
         self.request(
@@ -277,7 +385,7 @@ For setup and maintenance instructions, refer to the
             expected=(204, 404),
         )
 
-    def get_content(self, path: str, ref: str) -> Any:  # noqa: ANN401
+    def get_content(self, path: str, ref: str) -> Content | None:
         response = self.request(
             "GET",
             f"{self._repo_path()}/contents/{quote(path, safe='/')}",
@@ -286,16 +394,17 @@ For setup and maintenance instructions, refer to the
         )
         if response.status_code == 404:
             return None
-        return response.json()
+        content: Content = response.json()
+        return content
 
-    def content_bytes(self, content: Mapping[str, Any]) -> bytes:
+    def content_bytes(self, content: Content) -> bytes:
         if content.get("encoding") == "base64" and content.get("content"):
             return base64.b64decode(content["content"])
         git_url = content.get("git_url")
         if not git_url:
             raise GitHubError("GitHub did not return content or a blob URL")  # noqa: TRY003
-        blob = self.json("GET", git_url)
-        if blob.get("encoding") != "base64":
+        blob: Blob = self.json("GET", git_url)
+        if blob["encoding"] != "base64":
             raise GitHubError("GitHub returned an unsupported blob encoding")  # noqa: TRY003
         return base64.b64decode(blob["content"])
 
@@ -306,8 +415,8 @@ For setup and maintenance instructions, refer to the
         content: bytes,
         message: str,
         sha: str | None = None,
-    ) -> Any:  # noqa: ANN401
-        body = {
+    ) -> ContentUpdate:
+        body: dict[str, JSONValue] = {
             "message": message,
             "content": base64.b64encode(content).decode("ascii"),
             "branch": branch,
@@ -321,15 +430,18 @@ For setup and maintenance instructions, refer to the
             json=body,
         )
 
-    def get_release(self, tag: str) -> Any:  # noqa: ANN401
+    def get_release(self, tag: str) -> Release | None:
         response = self.request(
             "GET",
             f"{self._repo_path()}/releases/tags/{quote(tag, safe='')}",
             expected=(200, 404),
         )
-        return None if response.status_code == 404 else response.json()
+        if response.status_code == 404:
+            return None
+        release: Release = response.json()
+        return release
 
-    def create_release(self, tag: str, branch: str) -> Any:  # noqa: ANN401
+    def create_release(self, tag: str, branch: str) -> Release:
         return self.json(
             "POST",
             f"{self._repo_path()}/releases",
@@ -346,15 +458,21 @@ For setup and maintenance instructions, refer to the
             },
         )
 
-    def list_assets(self, release_id: int) -> list[Any]:
-        return list(
-            self.paginate(
-                f"{self._repo_path()}/releases/{release_id}/assets?per_page=100"
-            )
-        )
+    def list_assets(self, release_id: int) -> list[Asset]:
+        assets: list[Asset] = []
+        url = f"{self._repo_path()}/releases/{release_id}/assets?per_page=100"
+        while url:
+            response = self.request("GET", url)
+            page: list[Asset] = response.json()
+            assets.extend(page)
+            url = response.links.get("next", {}).get("url")
+        return assets
 
-    def upload_asset(self, release: Mapping[str, Any], path: Path, name: str) -> Any:  # noqa: ANN401
-        upload_url = release["upload_url"].split("{", 1)[0]
+    def upload_asset(self, release_id: int, path: Path, name: str) -> Asset:
+        upload_url = (
+            f"https://uploads.github.com{self._repo_path()}"
+            f"/releases/{release_id}/assets"
+        )
         with path.open("rb") as source:
             return self.json(
                 "POST",
@@ -365,13 +483,6 @@ For setup and maintenance instructions, refer to the
                 headers={"Content-Type": "application/octet-stream"},
                 data=source,
             )
-
-    def rename_asset(self, asset_id: int, name: str) -> Any:  # noqa: ANN401
-        return self.json(
-            "PATCH",
-            f"{self._repo_path()}/releases/assets/{asset_id}",
-            json={"name": name},
-        )
 
     def delete_asset(self, asset_id: int) -> None:
         self.request(
@@ -398,7 +509,7 @@ For setup and maintenance instructions, refer to the
         return f"/repos/{quote(self.owner, safe='')}/{quote(self.repo, safe='')}"
 
 
-def _response_message(response: Any) -> str:  # noqa: ANN401
+def _response_message(response: requests.Response) -> str:
     try:
         data = response.json()
     except ValueError:

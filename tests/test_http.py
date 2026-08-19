@@ -1,7 +1,7 @@
 import base64
 import json
 from collections.abc import Iterator
-from typing import cast
+from pathlib import Path
 
 import pytest
 import requests
@@ -12,6 +12,11 @@ from portage import getbinpkg
 from portage_github_binrepo import github
 
 API = "https://api.github.com"
+
+
+def request_json(request: requests.PreparedRequest) -> github.JSONValue:
+    assert isinstance(request.body, str | bytes | bytearray)
+    return json.loads(request.body)
 
 
 @pytest.fixture
@@ -57,15 +62,25 @@ def test_non_idempotent_request_is_not_retried(http: responses.RequestsMock) -> 
     assert len(http.calls) == 1
 
 
-def test_pagination_follows_link_header(http: responses.RequestsMock) -> None:
+def test_json_rejects_empty_response(http: responses.RequestsMock) -> None:
+    http.get(f"{API}/resource", body="")
+    client = github.GitHubClient("owner/repo", "secret")
+
+    with pytest.raises(github.GitHubError, match="empty JSON response"):
+        client.json("GET", "/resource")
+
+
+def test_list_assets_follows_link_header(http: responses.RequestsMock) -> None:
     second = "https://api.github.com/page/2"
     http.get(
-        f"{API}/page/1", json=[{"id": 1}], headers={"Link": f'<{second}>; rel="next"'}
+        f"{API}/repos/owner/repo/releases/1/assets?per_page=100",
+        json=[{"id": 1}],
+        headers={"Link": f'<{second}>; rel="next"'},
     )
     http.get(second, json=[{"id": 2}])
     client = github.GitHubClient("owner/repo", "secret")
 
-    assert list(client.paginate("/page/1")) == [{"id": 1}, {"id": 2}]
+    assert client.list_assets(1) == [{"id": 1}, {"id": 2}]
     assert http.calls[1].request.url == second
 
 
@@ -145,12 +160,15 @@ def test_repository_initializes_orphan_binrepo_branch(
             ("POST", "https://api.github.com/repos/owner/repo/git/refs"),
         ]
     )
-    bootstrap_body = json.loads(cast("bytes", http.calls[2].request.body))
+    bootstrap_body = request_json(http.calls[2].request)
+    assert isinstance(bootstrap_body, dict)
     assert bootstrap_body["message"] == snapshot("Initialize repo")
+    bootstrap_content = bootstrap_body["content"]
+    assert isinstance(bootstrap_content, str)
     assert "sync-uri = https://raw.githubusercontent.com/owner/repo/binrepo" in (
-        base64.b64decode(bootstrap_body["content"]).decode()
+        base64.b64decode(bootstrap_content).decode()
     )
-    assert json.loads(cast("bytes", http.calls[3].request.body)) == snapshot(
+    assert request_json(http.calls[3].request) == snapshot(
         {
             "tree": [
                 {
@@ -162,10 +180,10 @@ def test_repository_initializes_orphan_binrepo_branch(
             ]
         }
     )
-    assert json.loads(cast("bytes", http.calls[4].request.body)) == snapshot(
+    assert request_json(http.calls[4].request) == snapshot(
         {"message": "Initialize binrepo", "tree": "tree", "parents": []}
     )
-    assert json.loads(cast("bytes", http.calls[5].request.body)) == snapshot(
+    assert request_json(http.calls[5].request) == snapshot(
         {"ref": "refs/heads/binrepo", "sha": "commit"}
     )
 
@@ -249,7 +267,7 @@ def test_release_name_matches_tag_and_description_is_empty(
     client = github.GitHubClient("owner/repo", "secret")
 
     assert client.create_release("host/cat/package", "host") == {"id": 1}
-    assert json.loads(cast("bytes", http.calls[0].request.body)) == snapshot(
+    assert request_json(http.calls[0].request) == snapshot(
         {
             "tag_name": "host/cat/package",
             "target_commitish": "host",
@@ -260,3 +278,17 @@ def test_release_name_matches_tag_and_description_is_empty(
             "make_latest": "false",
         }
     )
+
+
+def test_asset_upload_addresses_release_by_index_id(
+    http: responses.RequestsMock, tmp_path: Path
+) -> None:
+    url = "https://uploads.github.com/repos/owner/repo/releases/42/assets"
+    http.post(url, json={"id": 7, "name": "asset.gpkg.tar", "size": 7}, status=201)
+    source = tmp_path / "asset.gpkg.tar"
+    source.write_bytes(b"package")
+    client = github.GitHubClient("owner/repo", "secret")
+
+    assert client.upload_asset(42, source, source.name)["id"] == 7
+
+    assert http.calls[0].request.url == f"{url}?name=asset.gpkg.tar"

@@ -1,11 +1,11 @@
 import base64
 import gzip
+import hashlib
 from collections.abc import Iterator
 from collections.abc import Mapping
+from io import StringIO
 from pathlib import Path
 from typing import Never
-from typing import TypedDict
-from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -20,24 +20,9 @@ from portage_github_binrepo import package as package_module
 from portage_github_binrepo import pull
 from portage_github_binrepo import push
 
-
-class Asset(TypedDict):
-    id: int
-    name: str
-    size: int
-
-
-class Release(TypedDict):
-    id: int
-    tag_name: str
-    name: str
-    body: str
-    upload_url: str
-
-
-class Content(TypedDict):
-    content: str
-    sha: str
+Asset = github.Asset
+Release = github.Release
+Content = github.Content
 
 
 def make_packages(
@@ -63,9 +48,37 @@ def make_packages(
     return "\n\n".join([f"PACKAGES: {len(paths)}\nCHOST: {chost}", *entries]) + "\n\n"
 
 
-def make_remote_packages(*paths: str, sizes: Mapping[str, int] | None = None) -> str:
-    return package_module._push_package_paths(
-        make_packages(*paths, sizes=sizes), github.BINREPO_BRANCH
+def make_remote_packages(
+    *paths: str, sizes: Mapping[str, int] | None = None, chost: str = "host"
+) -> str:
+    packages = make_packages(*paths, sizes=sizes, chost=chost)
+    entries = package_module.parse_packages(packages)
+    published = {}
+    for asset_id, (path, metadata) in enumerate(entries.items(), 9):
+        name = package_module.asset_name(
+            path, metadata["CPV"], metadata["CHOST"], "0" * 64
+        )
+        published[path] = (f"{github.BINREPO_BRANCH}/0/{name}", 1, asset_id)
+    return package_module._push_package_paths(packages, published)
+
+
+def remote_entry(packages: str, local_path: str) -> tuple[str, dict[str, str]]:
+    return next(
+        (path, metadata)
+        for path, metadata in package_module.parse_packages(packages).items()
+        if metadata[package_module.LOCAL_PATH_FIELD] == local_path
+    )
+
+
+def remote_ids(packages: str, metadata: Mapping[str, str]) -> tuple[int, int]:
+    return package_module.remote_ids(metadata, package_module.asset_ids(packages))
+
+
+def expected_asset_name(
+    path: str, cpv: str, chost: str, content: bytes, build_id: str | None = None
+) -> str:
+    return package_module.asset_name(
+        path, cpv, chost, hashlib.sha256(content).hexdigest(), build_id
     )
 
 
@@ -88,7 +101,7 @@ class FakeClient:
 
     def check(
         self, write: bool = True, branch: str = github.BINREPO_BRANCH
-    ) -> dict[str, str | bool]:
+    ) -> github.CheckResult:
         self.checks.append(write)
         self.check_branches.append(branch)
         return {
@@ -98,13 +111,15 @@ class FakeClient:
             "initialized": True,
         }
 
-    def get_ref(self, _ref: str) -> dict[str, dict[str, str]]:
+    def get_ref(self, ref: str) -> github.GitRef:
+        del ref
         return {"object": {"sha": "root"}}
 
     def delete_ref(self, ref: str) -> None:
         self.deleted_refs.append(ref)
 
-    def get_content(self, _path: str, _ref: str) -> Content | None:
+    def get_content(self, path: str, ref: str) -> Content | None:
+        del path, ref
         if self.contents is None:
             return None
         return {
@@ -117,23 +132,34 @@ class FakeClient:
 
     def put_content(
         self,
-        _path: str,
-        _branch: str,
+        path: str,
+        branch: str,
         content: bytes,
         message: str,
-        _sha: str | None = None,
-    ) -> dict[str, dict[str, str]]:
+        sha: str | None = None,
+    ) -> github.ContentUpdate:
+        del path, sha
         self.messages.append(message)
         self.puts += 1
-        self.put_branches.append(_branch)
+        self.put_branches.append(branch)
         self.contents = content.decode()
         return {"content": {"sha": "new"}}
+
+    def initialize_repository(
+        self, default_branch: str, branch: str = github.BINREPO_BRANCH
+    ) -> github.GitRef:
+        del default_branch, branch
+        return {"object": {"sha": "root"}}
+
+    def download_asset(self, asset_id: int, destination: Path) -> None:
+        del asset_id, destination
+        raise AssertionError
 
     def get_release(self, tag: str) -> Release | None:
         return self.releases.get(tag)
 
-    def create_release(self, tag: str, _branch: str) -> Release:
-        self.release_branches.append(_branch)
+    def create_release(self, tag: str, branch: str) -> Release:
+        self.release_branches.append(branch)
         release: Release = {
             "id": self.next_id,
             "tag_name": tag,
@@ -149,16 +175,11 @@ class FakeClient:
     def list_assets(self, release_id: int) -> list[Asset]:
         return list(self.assets[release_id])
 
-    def upload_asset(self, release: Release, path: Path, name: str) -> Asset:
+    def upload_asset(self, release_id: int, path: Path, name: str) -> Asset:
         asset: Asset = {"id": self.next_id, "name": name, "size": path.stat().st_size}
         self.next_id += 1
-        self.assets[release["id"]].append(asset)
+        self.assets[release_id].append(asset)
         return asset
-
-    def rename_asset(self, asset_id: int, name: str) -> Asset:
-        asset = self._asset(asset_id)
-        asset["name"] = name
-        return cast("Asset", dict(asset))
 
     def delete_asset(self, asset_id: int) -> None:
         for assets in self.assets.values():
@@ -166,18 +187,10 @@ class FakeClient:
 
     def delete_release(self, release_id: int) -> None:
         self.deleted_releases.append(release_id)
-        self.assets.pop(release_id)
+        self.assets.pop(release_id, None)
         for tag, release in list(self.releases.items()):
             if release["id"] == release_id:
                 del self.releases[tag]
-
-    def _asset(self, asset_id: int) -> Asset:
-        return next(
-            asset
-            for assets in self.assets.values()
-            for asset in assets
-            if asset["id"] == asset_id
-        )
 
 
 def write_pkgdir(tmp_path: Path, packages: str, files: Mapping[str, bytes]) -> None:
@@ -188,44 +201,48 @@ def write_pkgdir(tmp_path: Path, packages: str, files: Mapping[str, bytes]) -> N
         path.write_bytes(content)
 
 
-def test_layout_uses_readable_package_tags() -> None:
-    flat_gpkg = "acct-group/android-0-r2.gpkg.tar"
-    gpkg = "cat/pkg/pkg-1-1.gpkg.tar"
-    xpak = "cat/pkg-1.tbz2"
-    assert package_module.release_coordinates(
-        package_module._remote_package_path(
-            flat_gpkg, "acct-group/android-0-r2", "host", "binrepo"
+def test_layout_uses_shards_and_readable_asset_names() -> None:
+    packages = [
+        "acct-group/android-0-r2.gpkg.tar",
+        "cat/pkg/pkg-1-1.gpkg.tar",
+        "cat/pkg-1.tbz2",
+    ]
+    local = make_packages(*packages)
+    entries = package_module.parse_packages(local)
+    published = {}
+    for asset_id, (path, metadata) in enumerate(entries.items(), 9):
+        name = package_module.asset_name(
+            path, metadata["CPV"], metadata["CHOST"], "a" * 64
         )
-    ) == ("binrepo/host/acct-group/android", "android-0-r2.gpkg.tar")
-    assert package_module.release_coordinates(f"binrepo/host/{gpkg}") == (
-        "binrepo/host/cat/pkg",
-        "pkg-1-1.gpkg.tar",
+        assert name.startswith(f"host__{metadata['CPV'].replace('/', '__')}")
+        published[path] = (f"binrepo/0/{name}", 1, asset_id)
+    remote = package_module._push_package_paths(local, published)
+    assert (
+        package_module.parse_packages(package_module._restore_package_paths(remote))
+        == entries
     )
-    assert package_module.release_coordinates(
-        package_module._remote_package_path(xpak, "cat/pkg-1", "host", "binrepo")
-    ) == ("binrepo/host/cat/pkg", "pkg-1.tbz2")
-    assert package_module.release_coordinates(
-        package_module._remote_package_path(
-            "cat/pkg-2.xpak", "cat/pkg-2", "host", "binrepo"
-        )
-    ) == ("binrepo/host/cat/pkg", "pkg-2.xpak")
-    remote = package_module._push_package_paths(
-        make_packages(flat_gpkg, gpkg, xpak), "binrepo"
+    assert (
+        package_module.release_coordinates(
+            next(iter(published.values()))[0], "binrepo"
+        )[0]
+        == "binrepo/0"
     )
-    assert package_module.parse_packages(
-        package_module._restore_package_paths(remote)
-    ) == package_module.parse_packages(make_packages(flat_gpkg, gpkg, xpak))
-    assert "PATH: binrepo/host/acct-group/android/android-0-r2.gpkg.tar" in remote
-    assert f"{package_module.LOCAL_PATH_FIELD}: {flat_gpkg}" in remote
-    assert f"{package_module.LOCAL_PATH_FIELD}: {gpkg}" in remote
-    text = package_module.with_remote_uri(make_packages(gpkg), "owner/repo")
+    assert f"{package_module.LOCAL_PATH_FIELD}: {packages[0]}" in remote
+    assert f"{package_module.RELEASE_ID_FIELD}: 1" in remote
+    assert (
+        f"{package_module.ASSET_ID_FIELD}-9-PATH: "
+        f"{next(iter(published.values()))[0]}" in remote
+    )
+    text = package_module.with_remote_uri(local, "owner/repo")
     assert "URI: https://github.com/owner/repo/releases/download" in text
-    assert f"PATH: {gpkg}" in text
+    assert f"PATH: {packages[1]}" in text
 
 
 def test_remote_path_must_match_cpv() -> None:
     with pytest.raises(ValueError, match="CPV does not match package PATH"):
-        package_module._release_package_path("cat/pkg/pkg-1.gpkg.tar", "cat/other-1")
+        package_module._validate_release_package(
+            "cat/pkg/pkg-1.gpkg.tar", "cat/other-1"
+        )
 
 
 def test_remote_local_path_must_be_safe() -> None:
@@ -262,8 +279,8 @@ def test_branch_namespaces_packages_and_tags(tmp_path: Path) -> None:
 
     push.push(client, tmp_path, "testing")
 
-    assert list(client.releases) == ["testing/host/cat/pkg"]
-    assert "PATH: testing/host/cat/pkg/pkg-1.gpkg.tar" in (client.contents or "")
+    assert list(client.releases) == ["testing/0"]
+    assert "PATH: testing/0/host__cat__pkg-1__" in (client.contents or "")
     assert client.put_branches == ["testing"]
 
 
@@ -307,12 +324,13 @@ def test_initial_push_and_noop(tmp_path: Path) -> None:
     contents = client.contents
     assert contents is not None
     assert "URI: https://github.com/owner/repo/releases/download" in contents
-    assert "PATH: binrepo/host/acct-group/android/android-0-r2.gpkg.tar" in contents
+    name = expected_asset_name(package, "acct-group/android-0-r2", "host", content)
+    assert f"PATH: binrepo/0/{name}" in contents
     assert f"{package_module.LOCAL_PATH_FIELD}: {package}" in contents
-    assert client.releases["binrepo/host/acct-group/android"] == {
+    assert client.releases["binrepo/0"] == {
         "id": 1,
-        "tag_name": "binrepo/host/acct-group/android",
-        "name": "binrepo/host/acct-group/android",
+        "tag_name": "binrepo/0",
+        "name": "binrepo/0",
         "body": "",
         "upload_url": "unused",
     }
@@ -341,23 +359,15 @@ SIZE: 1
 
     push.push(client, tmp_path)
 
-    assert {
-        "branches": client.put_branches,
-        "paths": sorted(package_module.parse_packages(client.contents or "")),
-        "releases": sorted(client.releases),
-    } == snapshot(
-        {
-            "branches": ["binrepo"],
-            "paths": [
-                "binrepo/aarch64-unknown-linux-gnu/cat/pkg/pkg-1.gpkg.tar",
-                "binrepo/x86_64-pc-linux-gnu/cat/pkg/pkg-1.gpkg.tar",
-            ],
-            "releases": [
-                "binrepo/aarch64-unknown-linux-gnu/cat/pkg",
-                "binrepo/x86_64-pc-linux-gnu/cat/pkg",
-            ],
-        }
-    )
+    remote_entries = package_module.parse_packages(client.contents or "")
+    assert client.put_branches == ["binrepo"]
+    assert list(client.releases) == ["binrepo/0"]
+    assert len(remote_entries) == 2
+    assert all(path.startswith("binrepo/0/") for path in remote_entries)
+    assert {metadata["CHOST"] for metadata in remote_entries.values()} == {
+        "x86_64-pc-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+    }
 
 
 def test_push_reports_each_upload(
@@ -383,19 +393,56 @@ def test_push_reports_missing_packages_index(tmp_path: Path) -> None:
         push.push(FakeClient(), tmp_path)
 
 
-def test_push_rejects_colliding_remote_paths(tmp_path: Path) -> None:
+def test_content_addressed_names_avoid_local_path_collisions(tmp_path: Path) -> None:
     packages = ["cat/pkg-1.gpkg.tar", "cat/pkg/pkg-1.gpkg.tar"]
-    write_pkgdir(tmp_path, make_packages(*packages), dict.fromkeys(packages, b"x"))
+    index = """PACKAGES: 2
+CHOST: host
+
+CPV: cat/pkg-1
+PATH: cat/pkg-1.gpkg.tar
+SIZE: 1
+
+CPV: cat/pkg-1
+PATH: cat/pkg/pkg-1.gpkg.tar
+SIZE: 1
+
+"""
+    write_pkgdir(tmp_path, index, dict.fromkeys(packages, b"x"))
     client = FakeClient()
 
-    with pytest.raises(ValueError, match="both map") as error:
-        push.push(client, tmp_path)
+    push.push(client, tmp_path)
 
-    assert str(error.value) == snapshot(
-        "package PATHs cat/pkg-1.gpkg.tar and cat/pkg/pkg-1.gpkg.tar both map to binrepo/host/cat/pkg/pkg-1.gpkg.tar; remove one package file and run `emaint binhost --fix`"
-    )
-    assert client.contents is None
-    assert client.releases == {}
+    assert len(package_module.parse_packages(client.contents or "")) == 2
+    assert len({asset["name"] for asset in client.assets[1]}) == 2
+    assert list(client.releases) == ["binrepo/0"]
+
+
+def test_multi_instance_build_ids_avoid_asset_path_collisions(tmp_path: Path) -> None:
+    packages = ["cat/pkg/pkg-1-1.gpkg.tar", "cat/pkg/pkg-1-2.gpkg.tar"]
+    index = """PACKAGES: 2
+CHOST: host
+
+CPV: cat/pkg-1
+BUILD_ID: 1
+PATH: cat/pkg/pkg-1-1.gpkg.tar
+SIZE: 1
+
+CPV: cat/pkg-1
+BUILD_ID: 2
+PATH: cat/pkg/pkg-1-2.gpkg.tar
+SIZE: 1
+
+"""
+    write_pkgdir(tmp_path, index, dict.fromkeys(packages, b"x"))
+    client = FakeClient()
+
+    push.push(client, tmp_path)
+
+    remote_entries = package_module.parse_packages(client.contents or "")
+    assert set(remote_entries) == {
+        f"binrepo/0/{expected_asset_name(packages[0], 'cat/pkg-1', 'host', b'x', '1')}",
+        f"binrepo/0/{expected_asset_name(packages[1], 'cat/pkg-1', 'host', b'x', '2')}",
+    }
 
 
 def test_mixed_depth_paths_share_package_release(tmp_path: Path) -> None:
@@ -408,22 +455,89 @@ def test_mixed_depth_paths_share_package_release(tmp_path: Path) -> None:
 
     push.push(client, tmp_path)
 
-    assert list(client.releases) == ["binrepo/host/cat/pkg"]
-    release = client.releases["binrepo/host/cat/pkg"]
-    assert {asset["name"] for asset in client.assets[release["id"]]} == {
-        "pkg-1.gpkg.tar",
-        "pkg-2.tbz2",
-    }
+    assert list(client.releases) == ["binrepo/0"]
+    release = client.releases["binrepo/0"]
+    names = {asset["name"] for asset in client.assets[release["id"]]}
+    assert len(names) == 2
+    assert any(name.endswith(".gpkg.tar") for name in names)
+    assert any(name.endswith(".tbz2") for name in names)
+
+
+def test_push_rolls_over_full_shards_without_listing_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(push, "RELEASE_ASSET_LIMIT", 2)
+    packages = [
+        "cat/one/one-1.gpkg.tar",
+        "cat/two/two-1.gpkg.tar",
+        "cat/three/three-1.tbz2",
+    ]
+    contents = {path: str(index).encode() for index, path in enumerate(packages, 1)}
+    write_pkgdir(
+        tmp_path,
+        make_packages(
+            *packages, sizes={path: len(content) for path, content in contents.items()}
+        ),
+        contents,
+    )
+    client = FakeClient()
+    list_assets = Mock(wraps=client.list_assets)
+    object.__setattr__(client, "list_assets", list_assets)
+
+    push.push(client, tmp_path)
+
+    assert list(client.releases) == ["binrepo/0", "binrepo/1"]
+    assert [
+        len(client.assets[release["id"]]) for release in client.releases.values()
+    ] == [2, 1]
+    assert list_assets.call_count == 0
+    assert client.release_branches == ["binrepo", "binrepo"]
+
+
+def test_uncertain_release_creation_is_reconciled(tmp_path: Path) -> None:
+    package = "cat/pkg/pkg-1.gpkg.tar"
+    write_pkgdir(tmp_path, make_packages(package), {package: b"x"})
+    client = FakeClient()
+    create_release = client.create_release
+
+    def create_then_fail(tag: str, branch: str) -> Never:
+        create_release(tag, branch)
+        raise github.GitHubError("lost release response")  # noqa: TRY003
+
+    object.__setattr__(client, "create_release", create_then_fail)
+
+    assert push.push(client, tmp_path)["uploaded"] == 1
+    assert list(client.releases) == ["binrepo/0"]
+
+
+def test_nonempty_unindexed_release_reports_manual_cleanup(tmp_path: Path) -> None:
+    package = "cat/pkg/pkg-1.gpkg.tar"
+    write_pkgdir(tmp_path, make_packages(package), {package: b"x"})
+    client = FakeClient()
+    release = client.create_release("binrepo/0", "binrepo")
+    client.assets[release["id"]].append({"id": 2, "name": "orphan", "size": 1})
+    object.__setattr__(
+        client, "create_release", Mock(side_effect=github.GitHubError("already exists"))
+    )
+
+    with pytest.raises(github.GitHubError) as caught:
+        push.push(client, tmp_path)
+    assert str(caught.value) == snapshot(
+        "release binrepo/0 contains assets not recorded in Packages; delete it and "
+        "its tag with `gh release delete binrepo/0 --cleanup-tag --repo owner/repo`, "
+        "then retry"
+    )
 
 
 def test_removed_package_prunes_empty_release(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
     previous = make_remote_packages(package)
     client = FakeClient(previous)
-    tag, _ = package_module.release_coordinates(f"binrepo/host/{package}")
+    remote_path, metadata = remote_entry(previous, package)
+    tag, name = package_module.release_coordinates(remote_path, "binrepo")
     release = client.create_release(tag, "main")
     client.assets[release["id"]].append(
-        {"id": 9, "name": Path(package).name, "size": 1}
+        {"id": remote_ids(previous, metadata)[1], "name": name, "size": 1}
     )
     write_pkgdir(tmp_path, make_packages(), {})
 
@@ -438,10 +552,11 @@ def test_changed_package_replaces_asset(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
     previous = make_remote_packages(package)
     client = FakeClient(previous)
-    tag, _ = package_module.release_coordinates(f"binrepo/host/{package}")
+    remote_path, metadata = remote_entry(previous, package)
+    tag, old_name = package_module.release_coordinates(remote_path, "binrepo")
     release = client.create_release(tag, "main")
     client.assets[release["id"]].append(
-        {"id": 9, "name": Path(package).name, "size": 3}
+        {"id": remote_ids(previous, metadata)[1], "name": old_name, "size": 3}
     )
     content = b"new package"
     changed = make_packages(package, sizes={package: len(content)})
@@ -450,81 +565,80 @@ def test_changed_package_replaces_asset(tmp_path: Path) -> None:
     push.push(client, tmp_path)
 
     assert [asset["name"] for asset in client.assets[release["id"]]] == [
-        Path(package).name
+        expected_asset_name(package, "cat/pkg-1", "host", content)
     ]
     assert client.assets[release["id"]][0]["size"] == len(b"new package")
 
 
 def test_changed_package_prunes_previous_remote_coordinate(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
-    previous = package_module._push_package_paths(
-        make_packages(package, chost="old-host"), "binrepo"
-    )
+    previous = make_remote_packages(package, chost="old-host")
     client = FakeClient(previous)
-    old_tag, old_name = package_module.release_coordinates(
-        f"binrepo/old-host/{package}"
-    )
+    remote_path, metadata = remote_entry(previous, package)
+    old_tag, old_name = package_module.release_coordinates(remote_path, "binrepo")
     old_release = client.create_release(old_tag, "main")
-    client.assets[old_release["id"]].append({"id": 9, "name": old_name, "size": 1})
+    client.assets[old_release["id"]].append(
+        {"id": remote_ids(previous, metadata)[1], "name": old_name, "size": 1}
+    )
     write_pkgdir(tmp_path, make_packages(package, chost="new-host"), {package: b"x"})
 
     push.push(client, tmp_path)
 
-    assert sorted(client.releases) == ["binrepo/new-host/cat/pkg"]
-    assert client.deleted_releases == [old_release["id"]]
-    assert client.deleted_refs == [f"tags/{old_tag}"]
-
-
-def test_changed_package_prunes_backup_from_interrupted_replacement(
-    tmp_path: Path,
-) -> None:
-    package = "cat/pkg/pkg-1-1.gpkg.tar"
-    client = FakeClient(make_remote_packages(package))
-    tag, name = package_module.release_coordinates(f"binrepo/host/{package}")
-    release = client.create_release(tag, "main")
-    client.assets[release["id"]].append(
-        {"id": 9, "name": f"{name}{package_module.BACKUP_MARKER}interrupted", "size": 3}
+    assert sorted(client.releases) == ["binrepo/0"]
+    assert client.deleted_releases == []
+    assert client.deleted_refs == []
+    assert (
+        "new-host__cat__pkg-1__" in next(iter(client.assets[old_release["id"]]))["name"]
     )
-    content = b"new package"
+
+
+def test_metadata_only_change_reuses_content_addressed_asset(tmp_path: Path) -> None:
+    package = "cat/pkg/pkg-1-1.gpkg.tar"
+    content = b"x"
+    client = FakeClient()
+    write_pkgdir(
+        tmp_path, make_packages(package, sizes={package: 1}), {package: content}
+    )
+    push.push(client, tmp_path)
+    assets = list(client.assets[client.releases["binrepo/0"]["id"]])
     write_pkgdir(
         tmp_path,
-        make_packages(package, sizes={package: len(content)}),
+        make_packages(package, sizes={package: 1}).replace(
+            "SIZE: 1", "DESC: metadata changed\nSIZE: 1"
+        ),
         {package: content},
     )
 
-    push.push(client, tmp_path)
+    assert push.push(client, tmp_path)["uploaded"] == 0
 
-    assert client.assets[release["id"]] == [
-        {"id": 2, "name": name, "size": len(content)}
-    ]
-    contents = client.contents
-    assert contents is not None
-    assert package_module.CLEANUP_FIELD not in contents
+    assert client.assets[client.releases["binrepo/0"]["id"]] == assets
 
 
 def test_index_failure_restores_replaced_asset(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
     previous = make_remote_packages(package)
     client = FakeClient(previous)
-    tag, _ = package_module.release_coordinates(f"binrepo/host/{package}")
+    remote_path, metadata = remote_entry(previous, package)
+    tag, old_name = package_module.release_coordinates(remote_path, "binrepo")
     release = client.create_release(tag, "main")
     client.assets[release["id"]].append(
-        {"id": 9, "name": Path(package).name, "size": 3}
+        {"id": remote_ids(previous, metadata)[1], "name": old_name, "size": 3}
     )
     content = b"new package"
     changed = make_packages(package, sizes={package: len(content)})
     write_pkgdir(tmp_path, changed, {package: content})
 
-    def fail_put(*_args: object, **_kwargs: object) -> Never:
+    def fail_put(
+        path: str, branch: str, content: bytes, message: str, sha: str | None = None
+    ) -> Never:
+        del path, branch, content, message, sha
         raise github.GitHubError("conflict")
 
     object.__setattr__(client, "put_content", fail_put)
     with pytest.raises(github.GitHubError, match="conflict"):
         push.push(client, tmp_path)
 
-    assert client.assets[release["id"]] == [
-        {"id": 9, "name": Path(package).name, "size": 3}
-    ]
+    assert client.assets[release["id"]] == [{"id": 9, "name": old_name, "size": 3}]
 
 
 def test_index_failure_removes_created_release(tmp_path: Path) -> None:
@@ -544,17 +658,18 @@ def test_index_failure_removes_created_release(tmp_path: Path) -> None:
         push.push(client, tmp_path)
 
     assert client.releases == {}
-    assert client.deleted_refs == ["tags/binrepo/host/cat/pkg"]
+    assert client.deleted_refs == ["tags/binrepo/0"]
 
 
 def test_applied_index_update_is_reconciled_before_cleanup(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
     previous = make_remote_packages(package)
     client = FakeClient(previous)
-    tag, _ = package_module.release_coordinates(f"binrepo/host/{package}")
+    remote_path, metadata = remote_entry(previous, package)
+    tag, old_name = package_module.release_coordinates(remote_path, "binrepo")
     release = client.create_release(tag, "main")
     client.assets[release["id"]].append(
-        {"id": 9, "name": Path(package).name, "size": 3}
+        {"id": remote_ids(previous, metadata)[1], "name": old_name, "size": 3}
     )
     content = b"new package"
     changed = make_packages(package, sizes={package: len(content)})
@@ -571,20 +686,26 @@ def test_applied_index_update_is_reconciled_before_cleanup(tmp_path: Path) -> No
 
     assert push.push(client, tmp_path)["uploaded"] == 1
     assert client.assets[release["id"]] == [
-        {"id": 2, "name": Path(package).name, "size": len(content)}
+        {
+            "id": 2,
+            "name": expected_asset_name(package, "cat/pkg-1", "host", content),
+            "size": len(content),
+        }
     ]
     contents = client.contents
     assert contents is not None
     assert package_module.CLEANUP_FIELD not in contents
 
 
-def test_upload_reconciliation_failure_restores_backup(tmp_path: Path) -> None:
+def test_upload_reconciliation_failure_preserves_indexed_asset(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
-    client = FakeClient(make_remote_packages(package))
-    tag, _ = package_module.release_coordinates(f"binrepo/host/{package}")
+    previous = make_remote_packages(package)
+    client = FakeClient(previous)
+    remote_path, metadata = remote_entry(previous, package)
+    tag, old_name = package_module.release_coordinates(remote_path, "binrepo")
     release = client.create_release(tag, "main")
     client.assets[release["id"]].append(
-        {"id": 9, "name": Path(package).name, "size": 3}
+        {"id": remote_ids(previous, metadata)[1], "name": old_name, "size": 3}
     )
     content = b"new package"
     write_pkgdir(
@@ -592,38 +713,33 @@ def test_upload_reconciliation_failure_restores_backup(tmp_path: Path) -> None:
         make_packages(package, sizes={package: len(content)}),
         {package: content},
     )
-    list_assets = client.list_assets
-    calls = 0
 
-    def fail_upload(*_args: object, **_kwargs: object) -> Never:
+    def fail_upload(release_id: int, path: Path, name: str) -> Never:
+        del release_id, path, name
         raise github.GitHubError("upload failed")  # noqa: TRY003
 
-    def fail_reconciliation(release_id: int) -> list[Asset]:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise github.GitHubError("reconciliation failed")  # noqa: TRY003
-        return list_assets(release_id)
-
     object.__setattr__(client, "upload_asset", fail_upload)
-    object.__setattr__(client, "list_assets", fail_reconciliation)
+    object.__setattr__(
+        client,
+        "list_assets",
+        Mock(side_effect=github.GitHubError("reconciliation failed")),
+    )
 
     with pytest.raises(github.GitHubError, match="reconciliation failed"):
         push.push(client, tmp_path)
 
-    assert client.assets[release["id"]] == [
-        {"id": 9, "name": Path(package).name, "size": 3}
-    ]
+    assert client.assets[release["id"]] == [{"id": 9, "name": old_name, "size": 3}]
 
 
 def test_post_commit_cleanup_is_retried(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
     previous = make_remote_packages(package)
     client = FakeClient(previous)
-    tag, _ = package_module.release_coordinates(f"binrepo/host/{package}")
+    remote_path, metadata = remote_entry(previous, package)
+    tag, old_name = package_module.release_coordinates(remote_path, "binrepo")
     release = client.create_release(tag, "main")
     client.assets[release["id"]].append(
-        {"id": 9, "name": Path(package).name, "size": 3}
+        {"id": remote_ids(previous, metadata)[1], "name": old_name, "size": 3}
     )
     content = b"new package"
     changed = make_packages(package, sizes={package: len(content)})
@@ -648,7 +764,7 @@ def test_post_commit_cleanup_is_retried(tmp_path: Path) -> None:
     assert package_module.CLEANUP_FIELD in contents
     assert push.push(client, tmp_path) == {"uploaded": 0, "removed": 0, "unchanged": 1}
     assert [asset["name"] for asset in client.assets[release["id"]]] == [
-        Path(package).name
+        expected_asset_name(package, "cat/pkg-1", "host", content)
     ]
     contents = client.contents
     assert contents is not None
@@ -657,11 +773,19 @@ def test_post_commit_cleanup_is_retried(tmp_path: Path) -> None:
 
 def test_removed_package_cleanup_is_retried(tmp_path: Path) -> None:
     packages = ["cat/one/pkg-1.gpkg.tar", "cat/two/pkg-2.gpkg.tar"]
-    client = FakeClient(make_remote_packages(*packages))
-    for asset_id, package in enumerate(packages, 9):
-        tag, name = package_module.release_coordinates(f"binrepo/host/{package}")
-        release = client.create_release(tag, "main")
-        client.assets[release["id"]].append({"id": asset_id, "name": name, "size": 1})
+    previous = make_remote_packages(*packages)
+    client = FakeClient(previous)
+    remote_entries = package_module.parse_packages(previous)
+    tag = package_module.release_coordinates(next(iter(remote_entries)), "binrepo")[0]
+    release = client.create_release(tag, "main")
+    for remote_path, metadata in remote_entries.items():
+        client.assets[release["id"]].append(
+            {
+                "id": remote_ids(previous, metadata)[1],
+                "name": Path(remote_path).name,
+                "size": 1,
+            }
+        )
     write_pkgdir(tmp_path, make_packages(), {})
     delete_ref = client.delete_ref
     failed = False
@@ -686,6 +810,15 @@ def test_removed_package_cleanup_is_retried(tmp_path: Path) -> None:
     contents = client.contents
     assert contents is not None
     assert package_module.CLEANUP_FIELD not in contents
+
+
+def test_cleanup_is_validated_before_deleting_assets() -> None:
+    client = Mock()
+
+    with pytest.raises(ValueError, match="does not match binrepo branch"):
+        push._delete_cleanup(client, "binrepo", {(1, 2, "other/0")}, set(), set())
+
+    client.delete_asset.assert_not_called()
 
 
 def test_size_mismatch_is_rejected_before_push(tmp_path: Path) -> None:
@@ -769,7 +902,7 @@ def test_pull_cli_infers_repository_from_uri(
 
     make_client.assert_called_once_with("owner/repo", "secret")
     pull.assert_called_once_with(
-        make_client.return_value, uri, str(tmp_path / "Packages")
+        make_client.return_value, uri, str(tmp_path / "Packages"), None
     )
 
 
@@ -907,18 +1040,38 @@ def test_private_asset_pull_allows_download_in_repository(
     repository: str, tmp_path: Path
 ) -> None:
     client = Mock(repository=repository)
-    client.get_release.return_value = {"id": 1}
-    client.list_assets.return_value = [{"id": 2, "name": "pkg-1.gpkg.tar"}]
+    package = "cat/pkg/pkg-1.gpkg.tar"
+    packages = make_remote_packages(package)
+    remote_path, _ = remote_entry(packages, package)
+    cached = getbinpkg.PackageIndex(allowed_pkg_keys={"CHOST", "CPV", "PATH", "SIZE"})
+    cached.read(StringIO(packages))
+    cached.modified = False
+    output = StringIO()
+    cached.write(output)
+    packages = output.getvalue()
     destination = tmp_path / "pkg-1.gpkg.tar"
 
     pull.pull(
         client,
-        f"https://github.com/{repository}/releases/download/host/cat/pkg/pkg-1.gpkg.tar",
+        f"https://github.com/{repository}/releases/download/{remote_path}",
         destination,
+        packages,
     )
 
-    client.get_release.assert_called_once_with("host/cat/pkg")
-    client.download_asset.assert_called_once_with(2, destination)
+    assert package_module.RELEASE_ID_FIELD not in packages
+    client.download_asset.assert_called_once_with(
+        package_module.asset_ids(packages)[remote_path], destination
+    )
+
+
+def test_cached_packages_path_matches_portage_cache_layout(tmp_path: Path) -> None:
+    assert pull.cached_packages_path(
+        "https://github.com/owner/repo/releases/download/release/current/3/asset.gpkg.tar",
+        tmp_path,
+    ) == (
+        tmp_path
+        / "var/cache/edb/binhost/raw.githubusercontent.com/owner/repo/release/current/Packages"
+    )
 
 
 def test_failed_write_preserves_destination(tmp_path: Path) -> None:
@@ -1007,21 +1160,6 @@ def test_init_accepts_empty_existing_repository() -> None:
     client.initialize_repository.assert_not_called()
 
 
-def test_ensure_binrepo_branch_initializes_empty_repository() -> None:
-    client = Mock(repository="owner/repo")
-
-    assert (
-        push.ensure_binrepo_branch(
-            client, {"default_branch": "main", "initialized": False}, "binrepo"
-        )
-        == "binrepo"
-    )
-
-    client.initialize_repository.assert_called_once_with("main", "binrepo")
-    client.get_ref.assert_not_called()
-    client.sleep.assert_not_called()
-
-
 def test_init_and_check_cli_options() -> None:
     init = cli.make_parser().parse_args(
         ["init", "--repository", "owner/repo", "--token-file", "token", "--public"]
@@ -1081,7 +1219,7 @@ def test_push_is_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     calls = []
     lock = object()
 
-    def fake_push(client: object, pkgdir: Path, branch: str) -> dict[str, int]:
+    def fake_push(client: github.PushAPI, pkgdir: Path, branch: str) -> dict[str, int]:
         calls.append((client, pkgdir, branch))
         return {"uploaded": 0, "removed": 0, "unchanged": 1}
 
@@ -1090,7 +1228,7 @@ def test_push_is_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     unlockfile = Mock()
     monkeypatch.setattr(push, "lockfile", lockfile)
     monkeypatch.setattr(push, "unlockfile", unlockfile)
-    client = object()
+    client = FakeClient()
 
     result = push.push_locked(client, tmp_path)
 

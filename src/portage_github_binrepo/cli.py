@@ -15,6 +15,7 @@ from portage_github_binrepo.github import GitHubClient
 from portage_github_binrepo.github import GitHubError
 from portage_github_binrepo.init import init_repository
 from portage_github_binrepo.package import validate_branch
+from portage_github_binrepo.pull import cached_packages_path
 from portage_github_binrepo.pull import pull
 from portage_github_binrepo.pull import pull_locked
 from portage_github_binrepo.pull import repository_from_uri
@@ -158,7 +159,13 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 pull_locked(client, settings["PKGDIR"], branch)
             else:
-                pull(client, args.uri, args.destination)
+                try:
+                    cached = cached_packages_path(args.uri, config()["EROOT"])
+                except ValueError:
+                    packages_text = None
+                else:
+                    packages_text = cached.read_text(encoding="utf-8")
+                pull(client, args.uri, args.destination, packages_text)
     except (GitHubError, OSError, ValueError) as error:
         print(f"portage-github-binrepo: {error}", file=sys.stderr)
         return 1
