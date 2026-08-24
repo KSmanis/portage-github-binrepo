@@ -85,6 +85,9 @@ manual publishing run:
 portage-github-binrepo push
 ```
 
+Run only one producer at a time for each binrepo; concurrent pushes are not
+supported.
+
 #### PKGDIR initialization
 
 To bootstrap a builder, e.g., a stateless CI builder, the `pull` command can be
