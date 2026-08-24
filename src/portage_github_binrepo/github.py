@@ -23,7 +23,10 @@ from portage_github_binrepo.package import validate_branch
 
 API_VERSION = "2026-03-10"
 BINREPO_BRANCH = "binrepo"
+MAX_ASSET_SIZE = 2 * 1024**3
+MUTATION_INTERVAL = 8
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+MUTATIVE_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 BACKOFF = ExponentialBackoff(limit=60)
 
@@ -165,6 +168,7 @@ class GitHubClient:
         self.repository = repository
         self.session = session or requests.Session()
         self.sleep = sleep
+        self._last_mutation: float | None = None
         self.session.headers.update(
             {
                 "Accept": "application/vnd.github+json",
@@ -186,7 +190,18 @@ class GitHubClient:
     ) -> requests.Response:
         if url.startswith("/"):
             url = f"https://api.github.com{url}"
+        data = kwargs.get("data")
+        data_position = data.tell() if data is not None else None
         for attempt in range(retries + 1):
+            if attempt and data is not None and data_position is not None:
+                data.seek(data_position)
+            if method in MUTATIVE_METHODS:
+                now = time.monotonic()
+                if self._last_mutation is not None:
+                    delay = MUTATION_INTERVAL - (now - self._last_mutation)
+                    if delay > 0:
+                        self.sleep(delay)
+                self._last_mutation = time.monotonic()
             try:
                 response = self.session.request(method, url, timeout=timeout, **kwargs)
             except requests.RequestException as error:
@@ -198,22 +213,34 @@ class GitHubClient:
                 continue
             if response.status_code in expected:
                 return response
-            retryable = response.status_code in TRANSIENT_STATUSES or (
+            message = _response_message(response)
+            rate_limited = response.status_code == 429 or (
                 response.status_code == 403
                 and (
                     response.headers.get("Retry-After")
                     or response.headers.get("X-RateLimit-Remaining") == "0"
+                    or "rate limit" in message.casefold()
                 )
             )
             if (
-                retryable
+                (response.status_code in TRANSIENT_STATUSES or rate_limited)
                 and attempt < retries
-                and method in {"GET", "HEAD", "PUT", "PATCH", "DELETE"}
+                and (
+                    method in {"GET", "HEAD", "PUT", "PATCH", "DELETE"} or rate_limited
+                )
             ):
-                delay = response.headers.get("Retry-After")
-                self.sleep(min(float(delay), 60) if delay else BACKOFF(attempt))
+                retry_after = response.headers.get("Retry-After")
+                reset = response.headers.get("X-RateLimit-Reset")
+                if retry_after:
+                    delay = float(retry_after)
+                elif response.headers.get("X-RateLimit-Remaining") == "0" and reset:
+                    delay = max(0, float(reset) - time.time())
+                elif rate_limited:
+                    delay = 60 * BACKOFF(attempt)
+                else:
+                    delay = BACKOFF(attempt)
+                self.sleep(delay)
                 continue
-            message = _response_message(response)
             raise GitHubError(  # noqa: TRY003
                 f"GitHub {method} {response.url} returned {response.status_code}: {message}"
             )
@@ -249,7 +276,6 @@ class GitHubClient:
             "POST",
             path,
             expected=(201,),
-            retries=0,
             json={
                 "name": self.repo,
                 "description": "Portage binary package repository",
@@ -317,7 +343,6 @@ For setup and maintenance instructions, refer to the
             "POST",
             f"{self._repo_path()}/git/trees",
             expected=(201,),
-            retries=0,
             json={
                 "tree": [
                     {
@@ -333,7 +358,6 @@ For setup and maintenance instructions, refer to the
             "POST",
             f"{self._repo_path()}/git/commits",
             expected=(201,),
-            retries=0,
             json={"message": "Initialize binrepo", "tree": tree["sha"], "parents": []},
         )
         try:
@@ -341,7 +365,6 @@ For setup and maintenance instructions, refer to the
                 "POST",
                 f"{self._repo_path()}/git/refs",
                 expected=(201,),
-                retries=0,
                 json={"ref": f"refs/heads/{branch}", "sha": commit["sha"]},
             )
         except GitHubError:
@@ -446,7 +469,6 @@ For setup and maintenance instructions, refer to the
             "POST",
             f"{self._repo_path()}/releases",
             expected=(201,),
-            retries=0,
             json={
                 "tag_name": tag,
                 "target_commitish": branch,
@@ -469,6 +491,8 @@ For setup and maintenance instructions, refer to the
         return assets
 
     def upload_asset(self, release_id: int, path: Path, name: str) -> Asset:
+        if path.stat().st_size >= MAX_ASSET_SIZE:
+            raise ValueError("release assets must be smaller than 2 GiB")  # noqa: TRY003
         upload_url = (
             f"https://uploads.github.com{self._repo_path()}"
             f"/releases/{release_id}/assets"
@@ -478,7 +502,6 @@ For setup and maintenance instructions, refer to the
                 "POST",
                 upload_url,
                 expected=(201,),
-                retries=0,
                 params={"name": name},
                 headers={"Content-Type": "application/octet-stream"},
                 data=source,
@@ -514,7 +537,7 @@ def _response_message(response: requests.Response) -> str:
         data = response.json()
     except ValueError:
         return response.text[:500] or response.reason
-    return str(data.get("message", data))[:500]
+    return str(data.get("message", data) if isinstance(data, dict) else data)[:500]
 
 
 def write_stream(destination: str | Path, chunks: Iterable[bytes]) -> None:

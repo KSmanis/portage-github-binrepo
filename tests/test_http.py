@@ -2,6 +2,7 @@ import base64
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -26,7 +27,7 @@ def http() -> Iterator[responses.RequestsMock]:
 
 
 def test_safe_request_retries_transient_response(http: responses.RequestsMock) -> None:
-    http.get(f"{API}/resource", json={"message": "busy"}, status=503)
+    http.get(f"{API}/resource", json=["busy"], status=503)
     http.get(f"{API}/resource", json={"ok": True})
     sleeps = []
     client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
@@ -35,6 +36,99 @@ def test_safe_request_retries_transient_response(http: responses.RequestsMock) -
     assert len(http.calls) == 2
     assert sleeps == [1]
     assert http.calls[0].request.headers["Authorization"] == "Bearer secret"
+
+
+@pytest.mark.parametrize(
+    ("headers", "delay"),
+    (
+        ({"Retry-After": "120"}, 120),
+        ({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1120"}, 120),
+        ({}, 60),
+    ),
+)
+def test_rate_limit_waits_as_directed(
+    http: responses.RequestsMock,
+    monkeypatch: pytest.MonkeyPatch,
+    headers: dict[str, str],
+    delay: int,
+) -> None:
+    http.get(
+        f"{API}/resource",
+        json={"message": "secondary rate limit exceeded"},
+        status=429,
+        headers=headers,
+    )
+    http.get(f"{API}/resource", json={"ok": True})
+    sleeps = []
+    monkeypatch.setattr(github.time, "time", lambda: 1000)
+    client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
+
+    assert client.json("GET", "/resource") == {"ok": True}
+    assert sleeps == [delay]
+
+
+def test_rate_limited_upload_retries_with_exponential_backoff(
+    http: responses.RequestsMock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    url = "https://uploads.github.com/repos/owner/repo/releases/1/assets"
+    bodies = []
+    statuses = iter((429, 429, 429, 201))
+
+    def respond(request: requests.PreparedRequest) -> tuple[int, dict[str, str], str]:
+        assert isinstance(request.body, bytes)
+        bodies.append(request.body)
+        status = next(statuses)
+        return (
+            status,
+            {},
+            json.dumps(
+                {"message": "secondary rate limit exceeded"}
+                if status == 429
+                else {"id": 1, "name": "package", "size": 7}
+            ),
+        )
+
+    http.add_callback(responses.POST, url, callback=respond)
+    source = tmp_path / "package"
+    source.write_bytes(b"package")
+    sleeps = []
+    monkeypatch.setattr(
+        github.time, "monotonic", Mock(side_effect=[0, 0, 8, 8, 16, 16, 24, 24])
+    )
+    client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
+
+    assert client.upload_asset(1, source, source.name)["id"] == 1
+    assert bodies == [b"package"] * 4
+    assert sleeps == [60, 120, 240]
+
+
+def test_mutative_requests_are_spaced(http: responses.RequestsMock) -> None:
+    http.put(f"{API}/resource", json={"ok": True})
+    http.put(f"{API}/resource", json={"ok": True})
+    sleeps = []
+    clock = Mock(side_effect=[0, 0, 0, 0])
+    client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(github.time, "monotonic", clock)
+        client.json("PUT", "/resource")
+        client.json("PUT", "/resource")
+
+    assert sleeps == [github.MUTATION_INTERVAL]
+
+
+def test_oversized_asset_is_rejected_before_upload(
+    http: responses.RequestsMock, tmp_path: Path
+) -> None:
+    source = tmp_path / "package"
+    with source.open("wb") as stream:
+        stream.truncate(github.MAX_ASSET_SIZE)
+    client = github.GitHubClient("owner/repo", "secret")
+
+    with pytest.raises(ValueError, match="smaller than 2 GiB"):
+        client.upload_asset(1, source, source.name)
+
+    assert not http.calls
 
 
 def test_delete_asset_accepts_not_found_after_retry(
@@ -46,7 +140,9 @@ def test_delete_asset_accepts_not_found_after_retry(
     sleeps = []
     client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
 
-    client.delete_asset(1)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(github.time, "monotonic", Mock(side_effect=[0, 0, 8, 8]))
+        client.delete_asset(1)
 
     assert len(http.calls) == 2
     assert sleeps == [1]
@@ -146,7 +242,7 @@ def test_repository_initializes_orphan_binrepo_branch(
     http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
     http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
     http.post(f"{repo}/git/refs", json={"ref": "refs/heads/binrepo"}, status=201)
-    client = github.GitHubClient("owner/repo", "secret")
+    client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
 
     client.initialize_repository("main")
 
@@ -210,7 +306,7 @@ def test_repository_adds_binrepo_branch_without_changing_default_branch(
     http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
     http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
     http.post(f"{repo}/git/refs", json={"ref": "refs/heads/binrepo"}, status=201)
-    client = github.GitHubClient("owner/repo", "secret")
+    client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
 
     client.initialize_repository("main")
 
@@ -234,7 +330,7 @@ def test_repository_recovers_lost_readme_response(http: responses.RequestsMock) 
     http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
     http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
     http.post(f"{repo}/git/refs", json={"ref": "refs/heads/binrepo"}, status=201)
-    client = github.GitHubClient("owner/repo", "secret")
+    client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
 
     assert client.initialize_repository("main") == {"ref": "refs/heads/binrepo"}
 
@@ -252,7 +348,7 @@ def test_repository_recovers_lost_binrepo_ref_response(
         f"{repo}/git/ref/heads/binrepo",
         json={"ref": "refs/heads/binrepo", "object": {"sha": "commit"}},
     )
-    client = github.GitHubClient("owner/repo", "secret")
+    client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
 
     assert client.initialize_repository("main") == {
         "ref": "refs/heads/binrepo",
