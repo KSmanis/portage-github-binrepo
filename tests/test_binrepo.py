@@ -337,6 +337,33 @@ def test_initial_push_and_noop(tmp_path: Path) -> None:
     }
 
 
+def test_timestamp_only_change_is_noop(tmp_path: Path) -> None:
+    package = "cat/pkg/pkg-1.gpkg.tar"
+    content = b"x"
+    packages = (
+        make_packages(package)
+        .replace("PACKAGES: 1", "PACKAGES: 1\nTIMESTAMP: 1")
+        .replace("SIZE: 1", "MTIME: 1\nSIZE: 1")
+    )
+    write_pkgdir(tmp_path, packages, {package: content})
+    client = FakeClient()
+    push.push(client, tmp_path)
+    assets = list(client.assets[client.releases["binrepo/0"]["id"]])
+    index = client.contents
+    write_pkgdir(
+        tmp_path,
+        packages.replace("TIMESTAMP: 1", "TIMESTAMP: 2").replace(
+            "MTIME: 1", "MTIME: 2"
+        ),
+        {package: content},
+    )
+
+    assert push.push(client, tmp_path) == {"uploaded": 0, "removed": 0, "unchanged": 1}
+    assert client.puts == 1
+    assert client.assets[client.releases["binrepo/0"]["id"]] == assets
+    assert client.contents == index
+
+
 def test_push_aggregates_multiple_chosts_on_binrepo_branch(tmp_path: Path) -> None:
     packages = [
         "x86_64-pc-linux-gnu/cat/pkg/pkg-1.gpkg.tar",
@@ -612,6 +639,8 @@ def test_metadata_only_change_reuses_content_addressed_asset(tmp_path: Path) -> 
 
     assert push.push(client, tmp_path)["uploaded"] == 0
 
+    assert client.puts == 2
+    assert "DESC: metadata changed" in (client.contents or "")
     assert client.assets[client.releases["binrepo/0"]["id"]] == assets
 
 

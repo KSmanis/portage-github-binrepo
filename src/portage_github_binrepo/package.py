@@ -40,6 +40,14 @@ def _write_index(index: PackageIndex) -> str:
     return output.getvalue()
 
 
+def _normalize_index(text: str) -> str:
+    index = _read_index(text)
+    index.header.pop("TIMESTAMP", None)
+    for metadata in index.packages:
+        metadata.pop("MTIME", None)
+    return _write_index(index)
+
+
 def make_empty_packages() -> str:
     index = PackageIndex(default_header_data={"VERSION": "0"})
     output = StringIO()

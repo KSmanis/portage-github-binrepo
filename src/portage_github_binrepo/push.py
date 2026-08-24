@@ -13,6 +13,7 @@ from portage_github_binrepo.github import GitHubError
 from portage_github_binrepo.github import PushAPI
 from portage_github_binrepo.package import LOCAL_PATH_FIELD
 from portage_github_binrepo.package import _cleanup_assets
+from portage_github_binrepo.package import _normalize_index
 from portage_github_binrepo.package import _push_commit_message
 from portage_github_binrepo.package import _push_package_paths
 from portage_github_binrepo.package import _restore_package_paths
@@ -52,9 +53,11 @@ def push(
     if previous:
         previous_text = client.content_bytes(previous).decode("utf-8")
         previous_remote_entries = parse_packages(previous_text)
-        previous_entries = parse_packages(_restore_package_paths(previous_text))
+        previous_local_text = _restore_package_paths(previous_text)
+        previous_entries = parse_packages(previous_local_text)
     else:
         previous_text = ""
+        previous_local_text = ""
         previous_remote_entries = {}
         previous_entries = {}
 
@@ -81,8 +84,9 @@ def push(
         if previous_entries.get(path) != stanza
     ]
     removed = previous_entries.keys() - local_entries.keys()
-    commit_message = _push_commit_message(
-        local_entries, previous_entries, changed, removed
+    normalized_local_entries = parse_packages(_normalize_index(local_text))
+    normalized_previous_entries = (
+        parse_packages(_normalize_index(previous_local_text)) if previous else {}
     )
 
     releases: dict[int, int] = {}
@@ -102,6 +106,7 @@ def push(
         if local_path in local_entries and local_path not in changed
     }
     desired_names = {}
+    verified_changed = []
     for package_path in changed:
         source = local_packages[package_path]
         metadata = local_entries[package_path]
@@ -123,6 +128,16 @@ def push(
                 previous_metadata["PATH"],
                 *remote_ids(previous_metadata, previous_asset_ids),
             )
+            if (
+                normalized_previous_entries.get(package_path)
+                == normalized_local_entries[package_path]
+            ):
+                continue
+        verified_changed.append(package_path)
+    changed = verified_changed
+    commit_message = _push_commit_message(
+        local_entries, previous_entries, changed, removed
+    )
 
     uploaded: list[int] = []
     created_releases: list[tuple[int, str]] = []
@@ -171,7 +186,7 @@ def push(
         index = with_remote_uri(remote_text, client.repository, cleanup)
         index_bytes = index.encode()
         index_sha = previous.get("sha") if previous else None
-        if index != previous_text:
+        if _normalize_index(index) != _normalize_index(previous_text):
             try:
                 committed = client.put_content(
                     "Packages", branch, index_bytes, commit_message, index_sha
