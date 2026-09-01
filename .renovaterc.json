@@ -3,5 +3,8 @@
   "extends": [
     "KSmanis/renovate-config"
   ],
+  "lockFileMaintenance": {
+    "automerge": true
+  },
   "semanticCommits": "enabled"
 }
