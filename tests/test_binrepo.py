@@ -409,6 +409,7 @@ def test_changed_repo_revisions_header_is_not_volatile(tmp_path: Path) -> None:
 
     assert push.push(client, tmp_path) == {"uploaded": 0, "removed": 0, "unchanged": 1}
     assert client.puts == 2
+    assert client.messages == ["Add cat/pkg-1", "Update Packages index"]
     assert 'REPO_REVISIONS: {"gentoo": "new"}' in (client.contents or "")
 
 

@@ -369,5 +369,5 @@ def _push_commit_message(
     elif changed or removed:
         message = f"Update {len(changed) + len(removed)} binpkgs"
     else:
-        message = "Remove cleanup markers"
+        message = "Update Packages index"
     return f"{message[:69]}..." if len(message) > 72 else message
