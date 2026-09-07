@@ -40,12 +40,35 @@ def _write_index(index: PackageIndex) -> str:
     return output.getvalue()
 
 
-def _normalize_index(text: str) -> str:
-    index = _read_index(text)
-    index.header.pop("TIMESTAMP", None)
-    for metadata in index.packages:
-        metadata.pop("MTIME", None)
-    return _write_index(index)
+def _indexes_equivalent(left: str, right: str) -> bool:
+    indexes = (_read_index(left), _read_index(right))
+    for index in indexes:
+        index.header.pop("TIMESTAMP", None)
+
+    left_index, right_index = indexes
+    left_packages = {metadata["PATH"]: metadata for metadata in left_index.packages}
+    right_packages = {metadata["PATH"]: metadata for metadata in right_index.packages}
+    if (
+        left_index.header != right_index.header
+        or left_packages.keys() != right_packages.keys()
+    ):
+        return False
+    return all(
+        _metadata_equivalent(metadata, right_packages[path])
+        for path, metadata in left_packages.items()
+    )
+
+
+def _metadata_equivalent(left: Mapping[str, str], right: Mapping[str, str]) -> bool:
+    left = dict(left)
+    right = dict(right)
+    left.pop("MTIME", None)
+    right.pop("MTIME", None)
+    for field in ("MD5", "REPO_REVISIONS", "SHA1"):
+        if field not in left or field not in right:
+            left.pop(field, None)
+            right.pop(field, None)
+    return left == right
 
 
 def make_empty_packages() -> str:

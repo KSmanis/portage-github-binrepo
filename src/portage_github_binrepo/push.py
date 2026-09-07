@@ -13,7 +13,8 @@ from portage_github_binrepo.github import GitHubError
 from portage_github_binrepo.github import PushAPI
 from portage_github_binrepo.package import LOCAL_PATH_FIELD
 from portage_github_binrepo.package import _cleanup_assets
-from portage_github_binrepo.package import _normalize_index
+from portage_github_binrepo.package import _indexes_equivalent
+from portage_github_binrepo.package import _metadata_equivalent
 from portage_github_binrepo.package import _push_commit_message
 from portage_github_binrepo.package import _push_package_paths
 from portage_github_binrepo.package import _restore_package_paths
@@ -84,11 +85,6 @@ def push(
         if previous_entries.get(path) != stanza
     ]
     removed = previous_entries.keys() - local_entries.keys()
-    normalized_local_entries = parse_packages(_normalize_index(local_text))
-    normalized_previous_entries = (
-        parse_packages(_normalize_index(previous_local_text)) if previous else {}
-    )
-
     releases: dict[int, int] = {}
     counts: dict[int, int] = defaultdict(int)
     shards: dict[int, int] = {}
@@ -128,9 +124,8 @@ def push(
                 previous_metadata["PATH"],
                 *remote_ids(previous_metadata, previous_asset_ids),
             )
-            if (
-                normalized_previous_entries.get(package_path)
-                == normalized_local_entries[package_path]
+            if _metadata_equivalent(
+                local_entries[package_path], previous_entries.get(package_path, {})
             ):
                 continue
         verified_changed.append(package_path)
@@ -186,7 +181,7 @@ def push(
         index = with_remote_uri(remote_text, client.repository, cleanup)
         index_bytes = index.encode()
         index_sha = previous.get("sha") if previous else None
-        if _normalize_index(index) != _normalize_index(previous_text):
+        if not _indexes_equivalent(index, previous_text):
             try:
                 committed = client.put_content(
                     "Packages", branch, index_bytes, commit_message, index_sha

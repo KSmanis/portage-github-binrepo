@@ -337,24 +337,35 @@ def test_initial_push_and_noop(tmp_path: Path) -> None:
     }
 
 
-def test_timestamp_only_change_is_noop(tmp_path: Path) -> None:
+def test_volatile_metadata_change_is_noop(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1.gpkg.tar"
     content = b"x"
     packages = (
         make_packages(package)
-        .replace("PACKAGES: 1", "PACKAGES: 1\nTIMESTAMP: 1")
-        .replace("SIZE: 1", "MTIME: 1\nSIZE: 1")
+        .replace(
+            "PACKAGES: 1",
+            'PACKAGES: 1\nREPO_REVISIONS: {"gentoo": "old"}\nTIMESTAMP: 1',
+        )
+        .replace(
+            "SIZE: 1",
+            'MD5: old\nMTIME: 1\nREPO_REVISIONS: {"gentoo": "old"}\nSHA1: old\nSIZE: 1',
+        )
     )
     write_pkgdir(tmp_path, packages, {package: content})
     client = FakeClient()
     push.push(client, tmp_path)
     assets = list(client.assets[client.releases["binrepo/0"]["id"]])
     index = client.contents
+    assert index is not None
+    remote_path, metadata = remote_entry(index, package)
+    ids = remote_ids(index, metadata)
     write_pkgdir(
         tmp_path,
-        packages.replace("TIMESTAMP: 1", "TIMESTAMP: 2").replace(
-            "MTIME: 1", "MTIME: 2"
-        ),
+        packages.replace("TIMESTAMP: 1", "TIMESTAMP: 2")
+        .replace("MD5: old\n", "")
+        .replace("MTIME: 1", "MTIME: 2")
+        .replace('REPO_REVISIONS: {"gentoo": "old"}\nSHA1: old\n', "SHA1: old\n")
+        .replace("SHA1: old\n", ""),
         {package: content},
     )
 
@@ -362,6 +373,43 @@ def test_timestamp_only_change_is_noop(tmp_path: Path) -> None:
     assert client.puts == 1
     assert client.assets[client.releases["binrepo/0"]["id"]] == assets
     assert client.contents == index
+    current_path, current_metadata = remote_entry(client.contents, package)
+    assert (current_path, remote_ids(client.contents, current_metadata)) == (
+        remote_path,
+        ids,
+    )
+
+
+@pytest.mark.parametrize("field", ("MD5", "REPO_REVISIONS", "SHA1"))
+def test_changed_initial_metadata_is_not_volatile(tmp_path: Path, field: str) -> None:
+    package = "cat/pkg/pkg-1.gpkg.tar"
+    content = b"x"
+    packages = make_packages(package).replace("SIZE: 1", f"{field}: old\nSIZE: 1")
+    write_pkgdir(tmp_path, packages, {package: content})
+    client = FakeClient()
+    push.push(client, tmp_path)
+    assets = list(client.assets[client.releases["binrepo/0"]["id"]])
+    write_pkgdir(tmp_path, packages.replace("old", "new"), {package: content})
+
+    assert push.push(client, tmp_path) == {"uploaded": 0, "removed": 0, "unchanged": 0}
+    assert client.puts == 2
+    assert f"{field}: new" in (client.contents or "")
+    assert client.assets[client.releases["binrepo/0"]["id"]] == assets
+
+
+def test_changed_repo_revisions_header_is_not_volatile(tmp_path: Path) -> None:
+    package = "cat/pkg/pkg-1.gpkg.tar"
+    packages = make_packages(package).replace(
+        "PACKAGES: 1", 'PACKAGES: 1\nREPO_REVISIONS: {"gentoo": "old"}'
+    )
+    write_pkgdir(tmp_path, packages, {package: b"x"})
+    client = FakeClient()
+    push.push(client, tmp_path)
+    write_pkgdir(tmp_path, packages.replace('"old"', '"new"'), {package: b"x"})
+
+    assert push.push(client, tmp_path) == {"uploaded": 0, "removed": 0, "unchanged": 1}
+    assert client.puts == 2
+    assert 'REPO_REVISIONS: {"gentoo": "new"}' in (client.contents or "")
 
 
 def test_push_aggregates_multiple_chosts_on_binrepo_branch(tmp_path: Path) -> None:
@@ -471,6 +519,49 @@ SIZE: 1
         f"binrepo/0/{expected_asset_name(packages[0], 'cat/pkg-1', 'host', b'x', '1')}",
         f"binrepo/0/{expected_asset_name(packages[1], 'cat/pkg-1', 'host', b'x', '2')}",
     }
+
+
+def test_same_cpv_stanza_order_change_is_noop(tmp_path: Path) -> None:
+    packages = ["cat/pkg/pkg-1-1.gpkg.tar", "cat/pkg/pkg-1-2.gpkg.tar"]
+    index = """PACKAGES: 2
+CHOST: host
+
+CPV: cat/pkg-1
+BUILD_ID: 1
+PATH: cat/pkg/pkg-1-1.gpkg.tar
+SIZE: 1
+
+CPV: cat/pkg-1
+BUILD_ID: 2
+PATH: cat/pkg/pkg-1-2.gpkg.tar
+SIZE: 1
+
+"""
+    reversed_index = """PACKAGES: 2
+CHOST: host
+
+CPV: cat/pkg-1
+BUILD_ID: 2
+PATH: cat/pkg/pkg-1-2.gpkg.tar
+SIZE: 1
+
+CPV: cat/pkg-1
+BUILD_ID: 1
+PATH: cat/pkg/pkg-1-1.gpkg.tar
+SIZE: 1
+
+"""
+    contents = dict.fromkeys(packages, b"x")
+    write_pkgdir(tmp_path, index, contents)
+    client = FakeClient()
+    push.push(client, tmp_path)
+    assets = {release_id: list(items) for release_id, items in client.assets.items()}
+
+    write_pkgdir(tmp_path, reversed_index, contents)
+
+    assert push.push(client, tmp_path) == {"uploaded": 0, "removed": 0, "unchanged": 2}
+    assert client.puts == 1
+    assert client.assets == assets
 
 
 def test_mixed_depth_paths_share_package_release(tmp_path: Path) -> None:
@@ -592,6 +683,7 @@ def test_changed_package_replaces_asset(tmp_path: Path) -> None:
 
     push.push(client, tmp_path)
 
+    assert client.puts == 2
     assert [asset["name"] for asset in client.assets[release["id"]]] == [
         expected_asset_name(package, "cat/pkg-1", "host", content)
     ]
