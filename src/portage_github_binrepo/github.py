@@ -1,17 +1,14 @@
 """GitHub API client and streaming helpers."""
 
+from __future__ import annotations
+
 import base64
 import re
 import time
-from collections.abc import Callable
-from collections.abc import Iterable
-from collections.abc import Mapping
-from io import BufferedReader
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING
 from typing import Protocol
 from typing import TypedDict
-from typing import Unpack
 from urllib.parse import quote
 
 import requests
@@ -20,6 +17,14 @@ from portage.util.backoff import ExponentialBackoff
 
 from portage_github_binrepo.package import make_empty_packages
 from portage_github_binrepo.package import validate_branch
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterable
+    from collections.abc import Mapping
+    from io import BufferedReader
+    from typing import Literal
+    from typing import Unpack
 
 API_VERSION = "2026-03-10"
 BINREPO_BRANCH = "binrepo"

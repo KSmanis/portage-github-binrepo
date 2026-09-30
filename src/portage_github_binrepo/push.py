@@ -1,17 +1,18 @@
 """Push local Portage packages to GitHub Releases."""
 
+from __future__ import annotations
+
 import hashlib
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from portage.locks import lockfile
 from portage.locks import unlockfile
 
 from portage_github_binrepo.github import BINREPO_BRANCH
-from portage_github_binrepo.github import Asset
 from portage_github_binrepo.github import GitHubError
-from portage_github_binrepo.github import PushAPI
 from portage_github_binrepo.package import LOCAL_PATH_FIELD
 from portage_github_binrepo.package import _cleanup_assets
 from portage_github_binrepo.package import _indexes_equivalent
@@ -27,6 +28,10 @@ from portage_github_binrepo.package import remote_ids
 from portage_github_binrepo.package import validate_branch
 from portage_github_binrepo.package import validate_package_path
 from portage_github_binrepo.package import with_remote_uri
+
+if TYPE_CHECKING:
+    from portage_github_binrepo.github import Asset
+    from portage_github_binrepo.github import PushAPI
 
 RELEASE_ASSET_LIMIT = 1000
 

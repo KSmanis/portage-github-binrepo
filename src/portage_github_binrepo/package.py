@@ -1,18 +1,23 @@
 """Portage Packages index parsing and release-path mapping."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import re
-from collections.abc import Collection
-from collections.abc import Iterable
-from collections.abc import Mapping
 from io import StringIO
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 
 from portage.binpkg import get_binpkg_format
 from portage.exception import InvalidBinaryPackageFormat
 from portage.getbinpkg import PackageIndex
 from portage.versions import catpkgsplit
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
+    from collections.abc import Iterable
+    from collections.abc import Mapping
 
 CLEANUP_FIELD = "PGB-CLEANUP"
 LOCAL_PATH_FIELD = "PGB-LOCAL-PATH"
