@@ -90,8 +90,11 @@ def test_missing_remote_index_preserves_destination(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "failed_asset",
-    (None, 9, 10),
-    ids=("success", "first-download-fails", "second-download-fails"),
+    (
+        pytest.param(None, id="success"),
+        pytest.param(9, id="first-download-fails"),
+        pytest.param(10, id="second-download-fails"),
+    ),
 )
 def test_pull_locked_stages_downloads_before_replacing_cache(
     failed_asset: int | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -197,7 +200,11 @@ def test_cache_replacement_preserves_lock_and_unlinks_symlinks(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
-    "error", (errno.EXDEV, errno.EACCES), ids=("cross-device", "permission-denied")
+    "error",
+    (
+        pytest.param(errno.EXDEV, id="cross-device"),
+        pytest.param(errno.EACCES, id="permission-denied"),
+    ),
 )
 def test_cache_replacement_handles_move_errors(
     error: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -244,7 +251,11 @@ def test_repository_inference_rejects_unsupported_uri(uri: str) -> None:
 
 @pytest.mark.parametrize("name", ("Packages", "Packages.gz"))
 @pytest.mark.parametrize(
-    "branch", ("host", "release/current"), ids=("simple-branch", "nested-branch")
+    "branch",
+    (
+        pytest.param("host", id="simple-branch"),
+        pytest.param("release/current", id="nested-branch"),
+    ),
 )
 def test_private_index_pull_preserves_branch_and_compression(
     name: str, branch: str, tmp_path: Path

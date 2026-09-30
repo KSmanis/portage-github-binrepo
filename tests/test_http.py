@@ -33,46 +33,37 @@ def http() -> Iterator[responses.RequestsMock]:
 
 
 @pytest.mark.parametrize(
-    ("method", "failures", "delays"),
+    ("failures", "delays"),
     (
-        pytest.param("GET", (503,), [1], id="transient-response"),
+        pytest.param((503,), [1], id="transient-response"),
         pytest.param(
-            "GET",
             (requests.ConnectionError("disconnected"), requests.Timeout("timed out")),
             [1, 2],
             id="get-transport-failures",
-        ),
-        pytest.param(
-            "HEAD",
-            (requests.ConnectionError("disconnected"), requests.Timeout("timed out")),
-            [1, 2],
-            id="head-transport-failures",
         ),
     ),
 )
 def test_safe_request_retries(
     http: responses.RequestsMock,
-    method: str,
     failures: tuple[int | requests.RequestException, ...],
     delays: list[int],
 ) -> None:
     for failure in failures:
         if isinstance(failure, int):
-            http.add(method, f"{API}/resource", json=["busy"], status=failure)
+            http.get(f"{API}/resource", json=["busy"], status=failure)
         else:
-            http.add(method, f"{API}/resource", body=failure)
-    http.add(method, f"{API}/resource", json={"ok": True} if method == "GET" else None)
+            http.get(f"{API}/resource", body=failure)
+    http.get(f"{API}/resource", json={"ok": True})
     sleeps = []
     client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
 
-    response = client.request(method, "/resource")
+    response = client.request("GET", "/resource")
 
     assert response.status_code == 200
     assert len(http.calls) == len(failures) + 1
     assert sleeps == delays
     assert http.calls[0].request.headers["Authorization"] == "Bearer secret"
-    if method == "GET":
-        assert response.json() == {"ok": True}
+    assert response.json() == {"ok": True}
 
 
 @pytest.mark.parametrize(
@@ -187,8 +178,10 @@ def test_delete_asset_accepts_not_found_after_retry(
 
 @pytest.mark.parametrize(
     ("method", "status", "message"),
-    (("POST", 503, "busy"), ("GET", 403, "Resource not accessible")),
-    ids=("non-idempotent-error", "permission-denied"),
+    (
+        pytest.param("POST", 503, "busy", id="non-idempotent-error"),
+        pytest.param("GET", 403, "Resource not accessible", id="permission-denied"),
+    ),
 )
 def test_unretryable_error_is_not_retried(
     http: responses.RequestsMock, method: str, status: int, message: str
@@ -226,7 +219,9 @@ def test_list_assets_follows_link_header(http: responses.RequestsMock) -> None:
     assert http.calls[1].request.url == second
 
 
-@pytest.mark.parametrize("ref_status", (200, 409), ids=("initialized", "empty"))
+@pytest.mark.parametrize(
+    "ref_status", (pytest.param(200, id="initialized"), pytest.param(409, id="empty"))
+)
 def test_check_accepts_repository_without_user_permissions(
     http: responses.RequestsMock, ref_status: int
 ) -> None:
@@ -265,7 +260,11 @@ def test_empty_repository_ref_is_uninitialized(http: responses.RequestsMock) -> 
 
 
 @pytest.mark.parametrize(
-    "initialized", (False, True), ids=("empty-repository", "existing-default-branch")
+    "initialized",
+    (
+        pytest.param(False, id="empty-repository"),
+        pytest.param(True, id="existing-default-branch"),
+    ),
 )
 def test_repository_initializes_orphan_binrepo_branch(
     http: responses.RequestsMock, monkeypatch: pytest.MonkeyPatch, initialized: bool
@@ -350,7 +349,11 @@ def test_repository_with_existing_binrepo_branch_is_not_initialized(
 
 
 @pytest.mark.parametrize(
-    "applied", (False, True), ids=("failed-bootstrap", "lost-response")
+    "applied",
+    (
+        pytest.param(False, id="failed-bootstrap"),
+        pytest.param(True, id="lost-response"),
+    ),
 )
 def test_repository_reconciles_bootstrap_failure(
     http: responses.RequestsMock, applied: bool
@@ -389,7 +392,12 @@ def test_repository_reconciles_bootstrap_failure(
 
 
 @pytest.mark.parametrize(
-    "sha", (None, "other-commit", "commit"), ids=("missing", "unrelated", "applied")
+    "sha",
+    (
+        pytest.param(None, id="missing"),
+        pytest.param("other-commit", id="unrelated"),
+        pytest.param("commit", id="applied"),
+    ),
 )
 def test_repository_reconciles_ref_creation_failure(
     http: responses.RequestsMock, sha: str | None

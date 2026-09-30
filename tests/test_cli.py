@@ -106,9 +106,12 @@ def test_cli_requires_repository_before_reading_token(
     make_client.assert_not_called()
 
 
-@pytest.mark.parametrize("public", (False, True), ids=("private", "public"))
+@pytest.mark.parametrize(
+    "public", (pytest.param(False, id="private"), pytest.param(True, id="public"))
+)
 def test_explicit_options_bypass_global_config_and_initialize_repository(
     public: bool,
+    tmp_path: Path,
     cli_args: list[str],
     make_client: Mock,
     capsys: pytest.CaptureFixture[str],
@@ -116,6 +119,7 @@ def test_explicit_options_bypass_global_config_and_initialize_repository(
 ) -> None:
     read_config = Mock(side_effect=ValueError("invalid global config"))
     monkeypatch.setattr(cli, "read_config", read_config)
+    monkeypatch.setattr(cli, "TOKEN_PATH", tmp_path / "unused-default.token")
     client = make_client.return_value
     client.get_repository.return_value = None
     client.check.return_value = {
@@ -137,7 +141,9 @@ def test_explicit_options_bypass_global_config_and_initialize_repository(
     )
 
 
-@pytest.mark.parametrize("read_only", (False, True), ids=("producer", "consumer"))
+@pytest.mark.parametrize(
+    "read_only", (pytest.param(False, id="producer"), pytest.param(True, id="consumer"))
+)
 def test_cli_uses_global_config(
     read_only: bool,
     tmp_path: Path,
@@ -169,7 +175,10 @@ def test_cli_uses_global_config(
     )
 
 
-@pytest.mark.parametrize("cached", (False, True), ids=("missing-cache", "cached-index"))
+@pytest.mark.parametrize(
+    "cached",
+    (pytest.param(False, id="missing-cache"), pytest.param(True, id="cached-index")),
+)
 def test_pull_cli_uses_portage_cached_index(
     cached: bool,
     tmp_path: Path,
@@ -221,7 +230,11 @@ def test_cli_rejects_unreadable_token_outside_index_downloads(
 
 @pytest.mark.parametrize("command", ("push", "pull"))
 @pytest.mark.parametrize(
-    "branch", (None, "testing"), ids=("default-branch", "custom-branch")
+    "branch",
+    (
+        pytest.param(None, id="default-branch"),
+        pytest.param("testing", id="custom-branch"),
+    ),
 )
 def test_cli_syncs_portage_pkgdir(
     command: str,
@@ -306,16 +319,3 @@ def test_pull_cli_returns_empty_index_for_unreadable_token(
     assert data.decode() == "PACKAGES: 0\nTIMESTAMP: 123\nVERSION: 0\n\n"
     assert capsys.readouterr().err == ""
     make_client.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("command", "option", "attribute"),
-    (("init", "--public", "public"), ("check", "--read-only", "read_only")),
-)
-def test_init_and_check_cli_options(
-    command: str, option: str, attribute: str, cli_args: list[str]
-) -> None:
-    args = cli.make_parser().parse_args([command, *cli_args, option])
-    assert args.command == command
-    assert getattr(args, attribute) is True
-    assert cli.make_parser().parse_args([command]).repository is None

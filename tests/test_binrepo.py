@@ -1013,8 +1013,10 @@ def test_pull_rejects_missing_branch_on_initialized_repository(tmp_path: Path) -
 
 @pytest.mark.parametrize(
     ("existing", "initialized"),
-    ((False, True), (True, False)),
-    ids=("create-private", "existing-empty"),
+    (
+        pytest.param(False, True, id="create-private"),
+        pytest.param(True, False, id="existing-empty"),
+    ),
 )
 def test_init_creates_or_accepts_repository(existing: bool, initialized: bool) -> None:
     client = Mock()
@@ -1037,7 +1039,9 @@ def test_init_creates_or_accepts_repository(existing: bool, initialized: bool) -
     client.initialize_repository.assert_not_called()
 
 
-@pytest.mark.parametrize("fails", (False, True), ids=("success", "failure"))
+@pytest.mark.parametrize(
+    "fails", (pytest.param(False, id="success"), pytest.param(True, id="failure"))
+)
 def test_push_releases_lock(
     fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
