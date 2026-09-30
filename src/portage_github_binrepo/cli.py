@@ -114,62 +114,76 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(  # noqa: TRY003, TRY301
                 "repository must be set in the global config or with --repository"
             )
-        try:
-            token = read_token(token_file)
-        except PermissionError:
-            if (
-                args.command != "pull"
-                or args.uri is None
-                or not write_empty_index(args.uri, args.destination)
-            ):
-                raise
+        token = _read_token_for_command(args, token_file)
+        if token is None:
             return 0
         client = GitHubClient(repository, token)
-        if args.command == "init":
-            result = init_repository(client, private=not args.public, branch=branch)
-            print(
-                f"repository={repository} created={str(result['created']).lower()} "
-                f"private={str(result['private']).lower()} default_branch={result['default_branch']}"
-            )
-        elif args.command == "check":
-            result = check_repository(client, read_only=args.read_only, branch=branch)
-            print(
-                f"repository={repository}"
-                f" access={result['access']}"
-                f" private={str(result['private']).lower()}"
-                f" default_branch={result['default_branch']}"
-            )
-        elif args.command == "push":
-            settings = config()
-            if not settings.get("PKGDIR"):
-                raise ValueError(  # noqa: TRY003, TRY301
-                    "PKGDIR must be set in Portage configuration"
-                )
-            result = push_locked(client, settings["PKGDIR"], branch)
-            print(
-                f"uploaded={result['uploaded']} removed={result['removed']} "
-                f"unchanged={result['unchanged']}"
-            )
-        else:
-            if args.uri is None:
-                settings = config()
-                if not settings.get("PKGDIR"):
-                    raise ValueError(  # noqa: TRY003, TRY301
-                        "PKGDIR must be set in Portage configuration"
-                    )
-                pull_locked(client, settings["PKGDIR"], branch)
-            else:
-                try:
-                    cached = cached_packages_path(args.uri, config()["EROOT"])
-                except ValueError:
-                    packages_text = None
-                else:
-                    packages_text = cached.read_text(encoding="utf-8")
-                pull(client, args.uri, args.destination, packages_text)
+        _dispatch(client, args, branch)
     except (GitHubError, OSError, ValueError) as error:
         print(f"portage-github-binrepo: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def _read_token_for_command(args: argparse.Namespace, path: str | Path) -> str | None:
+    try:
+        return read_token(path)
+    except PermissionError:
+        if (
+            args.command != "pull"
+            or args.uri is None
+            or not write_empty_index(args.uri, args.destination)
+        ):
+            raise
+        return None
+
+
+def _dispatch(client: GitHubClient, args: argparse.Namespace, branch: str) -> None:
+    if args.command == "init":
+        result = init_repository(client, private=not args.public, branch=branch)
+        print(
+            f"repository={client.repository} created={str(result['created']).lower()} "
+            f"private={str(result['private']).lower()} default_branch={result['default_branch']}"
+        )
+    elif args.command == "check":
+        result = check_repository(client, read_only=args.read_only, branch=branch)
+        print(
+            f"repository={client.repository}"
+            f" access={result['access']}"
+            f" private={str(result['private']).lower()}"
+            f" default_branch={result['default_branch']}"
+        )
+    elif args.command == "push":
+        settings = config()
+        if not settings.get("PKGDIR"):
+            raise ValueError(  # noqa: TRY003
+                "PKGDIR must be set in Portage configuration"
+            )
+        result = push_locked(client, settings["PKGDIR"], branch)
+        print(
+            f"uploaded={result['uploaded']} removed={result['removed']} "
+            f"unchanged={result['unchanged']}"
+        )
+    else:
+        _pull(client, args, branch)
+
+
+def _pull(client: GitHubClient, args: argparse.Namespace, branch: str) -> None:
+    if args.uri is None:
+        settings = config()
+        if not settings.get("PKGDIR"):
+            raise ValueError(  # noqa: TRY003
+                "PKGDIR must be set in Portage configuration"
+            )
+        pull_locked(client, settings["PKGDIR"], branch)
+    else:
+        try:
+            cached = cached_packages_path(args.uri, config()["EROOT"])
+        except ValueError:
+            packages_text = None
+        else:
+            packages_text = cached.read_text(encoding="utf-8")
+        pull(client, args.uri, args.destination, packages_text)
 
 
 if __name__ == "__main__":

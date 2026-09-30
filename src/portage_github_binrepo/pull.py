@@ -47,25 +47,7 @@ def pull(
     parsed = urlparse(uri)
     parts = [unquote(part) for part in parsed.path.split("/") if part]
     if parsed.hostname == "raw.githubusercontent.com" and len(parts) >= 4:
-        owner, repo = parts[:2]
-        branch = validate_branch("/".join(parts[2:-1]))
-        if f"{owner}/{repo}" != client.repository or parts[-1] not in {
-            "Packages",
-            "Packages.gz",
-        }:
-            raise ValueError("index URI does not match configured repository")  # noqa: TRY003
-        if not client.get_ref(f"heads/{branch}"):
-            if client.check(write=False, branch=branch)["initialized"]:
-                raise GitHubError(f"branch not found: {branch}")  # noqa: TRY003
-            write_empty_index(uri, destination)
-            return
-        content = client.get_content("Packages", branch)
-        if not content:
-            raise GitHubError(f"Packages was not found on branch {branch}")  # noqa: TRY003
-        data = client.content_bytes(content)
-        if parts[-1] == "Packages.gz":
-            data = gzip.compress(data, mtime=0)
-        write_stream(Path(destination), [data])
+        _pull_index(client, uri, destination, parts)
         return
     if parsed.hostname != "github.com" or len(parts) < 7:
         raise ValueError("unsupported binrepo URI")  # noqa: TRY003
@@ -84,6 +66,30 @@ def pull(
     client.download_asset(
         asset_id(metadata, asset_ids(packages_text)), Path(destination)
     )
+
+
+def _pull_index(
+    client: PullAPI, uri: str, destination: str | Path, parts: list[str]
+) -> None:
+    owner, repo = parts[:2]
+    branch = validate_branch("/".join(parts[2:-1]))
+    if f"{owner}/{repo}" != client.repository or parts[-1] not in {
+        "Packages",
+        "Packages.gz",
+    }:
+        raise ValueError("index URI does not match configured repository")  # noqa: TRY003
+    if not client.get_ref(f"heads/{branch}"):
+        if client.check(write=False, branch=branch)["initialized"]:
+            raise GitHubError(f"branch not found: {branch}")  # noqa: TRY003
+        write_empty_index(uri, destination)
+        return
+    content = client.get_content("Packages", branch)
+    if not content:
+        raise GitHubError(f"Packages was not found on branch {branch}")  # noqa: TRY003
+    data = client.content_bytes(content)
+    if parts[-1] == "Packages.gz":
+        data = gzip.compress(data, mtime=0)
+    write_stream(Path(destination), [data])
 
 
 def pull_all(client: PullAPI, pkgdir: str | Path, branch: str = BINREPO_BRANCH) -> None:
@@ -143,16 +149,17 @@ def _replace_cache(pkgdir: Path, staging: Path) -> None:
         elif path.is_dir():
             path.rmdir()
     for source in staging.rglob("*"):
-        if source.is_file():
-            destination = pkgdir / source.relative_to(staging)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                source.replace(destination)
-            except OSError as error:
-                if error.errno != errno.EXDEV:
-                    raise
-                shutil.copy2(source, destination)
-                source.unlink()
+        if not source.is_file():
+            continue
+        destination = pkgdir / source.relative_to(staging)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            source.replace(destination)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copy2(source, destination)
+            source.unlink()
 
 
 def repository_from_uri(uri: str) -> str:
