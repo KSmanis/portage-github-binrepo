@@ -193,15 +193,7 @@ class GitHubClient:
         data = kwargs.get("data")
         data_position = data.tell() if data is not None else None
         for attempt in range(retries + 1):
-            if attempt and data is not None and data_position is not None:
-                data.seek(data_position)
-            if method in MUTATIVE_METHODS:
-                now = time.monotonic()
-                if self._last_mutation is not None:
-                    delay = MUTATION_INTERVAL - (now - self._last_mutation)
-                    if delay > 0:
-                        self.sleep(delay)
-                self._last_mutation = time.monotonic()
+            self._prepare_attempt(method, data, data_position, attempt)
             try:
                 response = self.session.request(method, url, timeout=timeout, **kwargs)
             except requests.RequestException as error:
@@ -214,37 +206,33 @@ class GitHubClient:
             if response.status_code in expected:
                 return response
             message = _response_message(response)
-            rate_limited = response.status_code == 429 or (
-                response.status_code == 403
-                and (
-                    response.headers.get("Retry-After")
-                    or response.headers.get("X-RateLimit-Remaining") == "0"
-                    or "rate limit" in message.casefold()
-                )
-            )
-            if (
-                (response.status_code in TRANSIENT_STATUSES or rate_limited)
-                and attempt < retries
-                and (
-                    method in {"GET", "HEAD", "PUT", "PATCH", "DELETE"} or rate_limited
-                )
+            rate_limited = _is_rate_limited(response, message)
+            if attempt < retries and _retryable_response(
+                method, response, rate_limited
             ):
-                retry_after = response.headers.get("Retry-After")
-                reset = response.headers.get("X-RateLimit-Reset")
-                if retry_after:
-                    delay = float(retry_after)
-                elif response.headers.get("X-RateLimit-Remaining") == "0" and reset:
-                    delay = max(0, float(reset) - time.time())
-                elif rate_limited:
-                    delay = 60 * BACKOFF(attempt)
-                else:
-                    delay = BACKOFF(attempt)
-                self.sleep(delay)
+                self.sleep(_retry_delay(response, rate_limited, attempt))
                 continue
             raise GitHubError(  # noqa: TRY003
                 f"GitHub {method} {response.url} returned {response.status_code}: {message}"
             )
         raise AssertionError("unreachable")
+
+    def _prepare_attempt(
+        self,
+        method: str,
+        data: BufferedReader | None,
+        data_position: int | None,
+        attempt: int,
+    ) -> None:
+        if attempt and data is not None and data_position is not None:
+            data.seek(data_position)
+        if method in MUTATIVE_METHODS:
+            now = time.monotonic()
+            if self._last_mutation is not None:
+                delay = MUTATION_INTERVAL - (now - self._last_mutation)
+                if delay > 0:
+                    self.sleep(delay)
+            self._last_mutation = time.monotonic()
 
     def json[T](
         self,
@@ -530,6 +518,39 @@ For setup and maintenance instructions, refer to the
 
     def _repo_path(self) -> str:
         return f"/repos/{quote(self.owner, safe='')}/{quote(self.repo, safe='')}"
+
+
+def _is_rate_limited(response: requests.Response, message: str) -> bool:
+    return response.status_code == 429 or (
+        response.status_code == 403
+        and bool(
+            response.headers.get("Retry-After")
+            or response.headers.get("X-RateLimit-Remaining") == "0"
+            or "rate limit" in message.casefold()
+        )
+    )
+
+
+def _retryable_response(
+    method: str, response: requests.Response, rate_limited: bool
+) -> bool:
+    return (response.status_code in TRANSIENT_STATUSES or rate_limited) and (
+        method in {"GET", "HEAD", "PUT", "PATCH", "DELETE"} or rate_limited
+    )
+
+
+def _retry_delay(
+    response: requests.Response, rate_limited: bool, attempt: int
+) -> float:
+    retry_after = response.headers.get("Retry-After")
+    reset = response.headers.get("X-RateLimit-Reset")
+    if retry_after:
+        return float(retry_after)
+    if response.headers.get("X-RateLimit-Remaining") == "0" and reset:
+        return max(0, float(reset) - time.time())
+    if rate_limited:
+        return 60 * BACKOFF(attempt)
+    return BACKOFF(attempt)
 
 
 def _response_message(response: requests.Response) -> str:

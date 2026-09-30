@@ -9,6 +9,7 @@ from portage.locks import lockfile
 from portage.locks import unlockfile
 
 from portage_github_binrepo.github import BINREPO_BRANCH
+from portage_github_binrepo.github import Asset
 from portage_github_binrepo.github import GitHubError
 from portage_github_binrepo.github import PushAPI
 from portage_github_binrepo.package import LOCAL_PATH_FIELD
@@ -85,22 +86,175 @@ def push(
         if previous_entries.get(path) != stanza
     ]
     removed = previous_entries.keys() - local_entries.keys()
-    releases: dict[int, int] = {}
-    counts: dict[int, int] = defaultdict(int)
-    shards: dict[int, int] = {}
-    for metadata in previous_remote_entries.values():
-        release_id, _ = remote_ids(metadata, previous_asset_ids)
-        shard = int(release_coordinates(metadata["PATH"], branch)[0].rsplit("/", 1)[1])
-        existing = releases.setdefault(release_id, shard)
-        if existing != shard or shards.setdefault(shard, release_id) != release_id:
-            raise ValueError("Packages contains conflicting release metadata")  # noqa: TRY003
-        counts[release_id] += 1
+    releases, counts, shards = _release_inventory(
+        previous_remote_entries, previous_asset_ids, branch
+    )
 
     published = {
         local_path: (metadata["PATH"], *remote_ids(metadata, previous_asset_ids))
         for local_path, metadata in previous_remote_by_local.items()
         if local_path in local_entries and local_path not in changed
     }
+    changed, desired_names = _verify_changed_packages(
+        changed,
+        local_packages,
+        local_entries,
+        previous_remote_by_local,
+        previous_entries,
+        previous_asset_ids,
+        published,
+    )
+    commit_message = _push_commit_message(
+        local_entries, previous_entries, changed, removed
+    )
+
+    uploaded: list[int] = []
+    created_releases: list[tuple[int, str]] = []
+    try:
+        for package_path in changed:
+            if package_path in published:
+                continue
+            release_id, shard = _release_with_capacity(
+                client, branch, releases, counts, shards, created_releases
+            )
+            source = local_packages[package_path]
+            name = desired_names[package_path]
+            print(f"Uploading {package_path}", file=sys.stderr)
+            asset = _upload_asset(client, release_id, source, name)
+            asset_id = int(asset["id"])
+            uploaded.append(asset_id)
+            counts[release_id] += 1
+            published[package_path] = (f"{branch}/{shard}/{name}", release_id, asset_id)
+
+        cleanup = {
+            (
+                *remote_ids(metadata, previous_asset_ids),
+                release_coordinates(metadata["PATH"], branch)[0],
+            )
+            for local_path, metadata in previous_remote_by_local.items()
+            if local_path not in published
+            or remote_ids(metadata, previous_asset_ids)[1] != published[local_path][2]
+        }
+        remote_text = _push_package_paths(local_text, published)
+        index = with_remote_uri(remote_text, client.repository, cleanup)
+        index_bytes = index.encode()
+        index_sha = previous.get("sha") if previous else None
+        index_changed = not _indexes_equivalent(index, previous_text)
+    except Exception:
+        _rollback_uploads(client, uploaded, created_releases)
+        raise
+
+    if index_changed:
+        index_sha = _commit_index(
+            client,
+            branch,
+            index_bytes,
+            commit_message,
+            index_sha,
+            uploaded,
+            created_releases,
+        )
+
+    _delete_cleanup(
+        client,
+        branch,
+        cleanup,
+        {asset_id for _, _, asset_id in published.values()},
+        {release_id for _, release_id, _ in published.values()},
+    )
+
+    _clear_cleanup_markers(client, branch, remote_text, index, index_sha)
+
+    return {
+        "uploaded": len(uploaded),
+        "removed": len(removed),
+        "unchanged": len(local_entries) - len(changed),
+    }
+
+
+def _commit_index(
+    client: PushAPI,
+    branch: str,
+    content: bytes,
+    message: str,
+    sha: str | None,
+    uploaded: list[int],
+    created_releases: list[tuple[int, str]],
+) -> str:
+    rollback_safe = True
+    try:
+        try:
+            committed = client.put_content("Packages", branch, content, message, sha)
+            return committed["content"]["sha"]
+        except GitHubError:
+            try:
+                current = client.get_content("Packages", branch)
+            except GitHubError:
+                rollback_safe = False
+                raise
+            if not current or client.content_bytes(current) != content:
+                raise
+            return current["sha"]
+    except Exception:
+        if rollback_safe:
+            _rollback_uploads(client, uploaded, created_releases)
+        raise
+
+
+def _clear_cleanup_markers(
+    client: PushAPI, branch: str, remote_text: str, index: str, index_sha: str | None
+) -> None:
+    clean_index = with_remote_uri(remote_text, client.repository)
+    if clean_index != index:
+        clean_bytes = clean_index.encode()
+        try:
+            client.put_content(
+                "Packages", branch, clean_bytes, "Remove cleanup markers", index_sha
+            )
+        except GitHubError:
+            committed = client.get_content("Packages", branch)
+            if not committed or client.content_bytes(committed) != clean_bytes:
+                raise
+
+
+def _rollback_uploads(
+    client: PushAPI, uploaded: list[int], created_releases: list[tuple[int, str]]
+) -> None:
+    for asset_id in reversed(uploaded):
+        client.delete_asset(asset_id)
+    for release_id, tag in reversed(created_releases):
+        client.delete_release(release_id)
+        client.delete_ref(f"tags/{tag}")
+
+
+def _upload_asset(client: PushAPI, release_id: int, source: Path, name: str) -> Asset:
+    try:
+        asset = client.upload_asset(release_id, source, name)
+    except GitHubError:
+        asset = next(
+            (
+                item
+                for item in client.list_assets(release_id)
+                if item["name"] == name and item.get("size") == source.stat().st_size
+            ),
+            None,
+        )
+        if asset is None:
+            raise
+    if asset.get("name") != name or asset.get("size") != source.stat().st_size:
+        raise GitHubError(f"GitHub returned invalid asset metadata for {name}")  # noqa: TRY003
+    return asset
+
+
+def _verify_changed_packages(
+    changed: list[str],
+    local_packages: dict[str, Path],
+    local_entries: dict[str, dict[str, str]],
+    previous_remote_by_local: dict[str, dict[str, str]],
+    previous_entries: dict[str, dict[str, str]],
+    previous_asset_ids: dict[str, int],
+    published: dict[str, tuple[str, int, int]],
+) -> tuple[list[str], dict[str, str]]:
     desired_names = {}
     verified_changed = []
     for package_path in changed:
@@ -129,107 +283,24 @@ def push(
             ):
                 continue
         verified_changed.append(package_path)
-    changed = verified_changed
-    commit_message = _push_commit_message(
-        local_entries, previous_entries, changed, removed
-    )
+    return verified_changed, desired_names
 
-    uploaded: list[int] = []
-    created_releases: list[tuple[int, str]] = []
-    rollback_safe = True
-    try:
-        for package_path in changed:
-            if package_path in published:
-                continue
-            release_id, shard = _release_with_capacity(
-                client, branch, releases, counts, shards, created_releases
-            )
-            source = local_packages[package_path]
-            name = desired_names[package_path]
-            print(f"Uploading {package_path}", file=sys.stderr)
-            try:
-                asset = client.upload_asset(release_id, source, name)
-            except GitHubError:
-                asset = next(
-                    (
-                        item
-                        for item in client.list_assets(release_id)
-                        if item["name"] == name
-                        and item.get("size") == source.stat().st_size
-                    ),
-                    None,
-                )
-                if asset is None:
-                    raise
-            if asset.get("name") != name or asset.get("size") != source.stat().st_size:
-                raise GitHubError(f"GitHub returned invalid asset metadata for {name}")  # noqa: TRY003, TRY301
-            asset_id = int(asset["id"])
-            uploaded.append(asset_id)
-            counts[release_id] += 1
-            published[package_path] = (f"{branch}/{shard}/{name}", release_id, asset_id)
 
-        cleanup = {
-            (
-                *remote_ids(metadata, previous_asset_ids),
-                release_coordinates(metadata["PATH"], branch)[0],
-            )
-            for local_path, metadata in previous_remote_by_local.items()
-            if local_path not in published
-            or remote_ids(metadata, previous_asset_ids)[1] != published[local_path][2]
-        }
-        remote_text = _push_package_paths(local_text, published)
-        index = with_remote_uri(remote_text, client.repository, cleanup)
-        index_bytes = index.encode()
-        index_sha = previous.get("sha") if previous else None
-        if not _indexes_equivalent(index, previous_text):
-            try:
-                committed = client.put_content(
-                    "Packages", branch, index_bytes, commit_message, index_sha
-                )
-                index_sha = committed["content"]["sha"]
-            except GitHubError:
-                try:
-                    committed = client.get_content("Packages", branch)
-                except GitHubError:
-                    rollback_safe = False
-                    raise
-                if not committed or client.content_bytes(committed) != index_bytes:
-                    raise
-                index_sha = committed["sha"]
-    except Exception:
-        if rollback_safe:
-            for asset_id in reversed(uploaded):
-                client.delete_asset(asset_id)
-            for release_id, tag in reversed(created_releases):
-                client.delete_release(release_id)
-                client.delete_ref(f"tags/{tag}")
-        raise
+def _release_inventory(
+    entries: dict[str, dict[str, str]], asset_ids: dict[str, int], branch: str
+) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+    releases: dict[int, int] = {}
+    counts: dict[int, int] = defaultdict(int)
+    shards: dict[int, int] = {}
+    for metadata in entries.values():
+        release_id, _ = remote_ids(metadata, asset_ids)
+        shard = int(release_coordinates(metadata["PATH"], branch)[0].rsplit("/", 1)[1])
+        existing = releases.setdefault(release_id, shard)
+        if existing != shard or shards.setdefault(shard, release_id) != release_id:
+            raise ValueError("Packages contains conflicting release metadata")  # noqa: TRY003
+        counts[release_id] += 1
 
-    _delete_cleanup(
-        client,
-        branch,
-        cleanup,
-        {asset_id for _, _, asset_id in published.values()},
-        {release_id for _, release_id, _ in published.values()},
-    )
-
-    clean_index = with_remote_uri(remote_text, client.repository)
-    if clean_index != index:
-        clean_bytes = clean_index.encode()
-        try:
-            client.put_content(
-                "Packages", branch, clean_bytes, "Remove cleanup markers", index_sha
-            )
-        except GitHubError:
-            committed = client.get_content("Packages", branch)
-            if not committed or client.content_bytes(committed) != clean_bytes:
-                raise
-
-    return {
-        "uploaded": len(uploaded),
-        "removed": len(removed),
-        "unchanged": len(local_entries) - len(changed),
-    }
+    return releases, counts, shards
 
 
 def _remote_entries_by_local(
