@@ -19,31 +19,30 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Install Python dependencies
         run: uv sync --only-group lint
-      - name: Identify Python version
-        id: identify-python
-        run: echo "python-version=$(uv run python -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
       - name: Cache prek hooks
         id: cache-prek-hooks
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/prek
-          key: prek|${{ steps.identify-python.outputs.python-version }}|${{ hashFiles('.pre-commit-config.yaml') }}
-          restore-keys: |
-            prek|${{ steps.identify-python.outputs.python-version }}|
-            prek|
-      - name: Prune prek hooks
-        if: steps.cache-prek-hooks.outputs.cache-hit != 'true'
-        run: uv run prek gc
+          key: prek|${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: prek|
       - name: Create dummy commit from PR title
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          GIT_AUTHOR_NAME: ${{ github.event.pull_request.user.login }}
+          GIT_AUTHOR_EMAIL: ${{ github.event.pull_request.user.id }}+${{ github.event.pull_request.user.login }}@users.noreply.github.com
         run: |
-          git config user.name '${{ github.event.pull_request.user.login }}'
-          git config user.email '${{ github.event.pull_request.user.id }}+${{ github.event.pull_request.user.login }}@users.noreply.github.com'
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
           git commit --allow-empty -m "${PR_TITLE}"
       - name: Run gitlint
         run: uv run prek run --hook-stage manual gitlint-ci
+      - name: Prune prek hooks
+        if: steps.cache-prek-hooks.outputs.cache-hit != 'true'
+        run: uv run prek cache gc

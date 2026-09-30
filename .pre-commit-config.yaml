@@ -30,7 +30,7 @@ repos:
       - id: trailing-whitespace
         priority: *write-serial
   - repo: https://github.com/renovatebot/pre-commit-hooks
-    rev: 44.106.0
+    rev: 44.115.13
     hooks:
       - id: renovate-config-validator
         args: ["--strict"]
@@ -57,6 +57,11 @@ repos:
     rev: v1.7.12
     hooks:
       - id: actionlint
+        priority: *read-only
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.30.1
+    hooks:
+      - id: zizmor
         priority: *read-only
   # JSON
   - repo: builtin

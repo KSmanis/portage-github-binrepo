@@ -2,7 +2,7 @@ name: lint
 on: [pull_request, push, workflow_dispatch]
 concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
 jobs:
   lint:
     env:
@@ -17,24 +17,24 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Install Python dependencies
         run: uv sync
-      - name: Identify Python version
-        id: identify-python
-        run: echo "python-version=$(uv run python -V | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
       - name: Cache prek hooks
         id: cache-prek-hooks
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/prek
-          key: prek|${{ steps.identify-python.outputs.python-version }}|${{ hashFiles('.pre-commit-config.yaml') }}
-          restore-keys: |
-            prek|${{ steps.identify-python.outputs.python-version }}|
-            prek|
-      - name: Prune prek hooks
-        if: steps.cache-prek-hooks.outputs.cache-hit != 'true'
-        run: uv run prek gc
+          key: prek|${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: prek|
+      - name: Run gitlint
+        run: uv run prek run --hook-stage manual gitlint-ci
       - name: Run prek
         run: uv run prek run --all-files --show-diff-on-failure
+      - name: Prune prek hooks
+        if: steps.cache-prek-hooks.outputs.cache-hit != 'true'
+        run: uv run prek cache gc
