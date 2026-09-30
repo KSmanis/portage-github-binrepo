@@ -150,27 +150,69 @@ def pull_locked(
 
 
 def _replace_cache(pkgdir: Path, staging: Path) -> None:
+    pkgdir.mkdir(parents=True, exist_ok=True)
+    for retained in pkgdir.glob(".binrepo-backup-*"):
+        raise FileExistsError(  # noqa: TRY003
+            f"Recover retained cache backup before pulling: {retained}"
+        )
+    paths = [
+        path
+        for path in pkgdir.rglob("*")
+        if (path.is_symlink() or path.is_file())
+        and not path.name.endswith(".portage_lockfile")
+    ]
+    backup = Path(tempfile.mkdtemp(dir=pkgdir, prefix=".binrepo-backup-"))
+    saved: list[Path] = []
+    installed: list[Path] = []
+    try:
+        for path in paths:
+            relative = path.relative_to(pkgdir)
+            _move_cache_file(path, backup / relative)
+            saved.append(relative)
+        for source in staging.rglob("*"):
+            if not source.is_file():
+                continue
+            destination = pkgdir / source.relative_to(staging)
+            # A failed cross-filesystem copy can leave a partial destination.
+            installed.append(destination)
+            _move_cache_file(source, destination)
+    except BaseException:
+        try:
+            for destination in reversed(installed):
+                destination.unlink(missing_ok=True)
+            _remove_empty_cache_directories(pkgdir, exclude=backup)
+            for relative in saved:
+                _move_cache_file(backup / relative, pkgdir / relative)
+        except BaseException as error:
+            error.add_note(f"Cache backup retained at {backup}")
+            raise
+        shutil.rmtree(backup)
+        raise
+    shutil.rmtree(backup)
+    _remove_empty_cache_directories(pkgdir)
+
+
+def _remove_empty_cache_directories(
+    pkgdir: Path, *, exclude: Path | None = None
+) -> None:
     for path in sorted(
         pkgdir.rglob("*"), key=lambda item: len(item.parts), reverse=True
     ):
-        if path.name.endswith(".portage_lockfile"):
+        if path == exclude or exclude in path.parents:
             continue
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.is_dir():
+        if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
             path.rmdir()
-    for source in staging.rglob("*"):
-        if not source.is_file():
-            continue
-        destination = pkgdir / source.relative_to(staging)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            source.replace(destination)
-        except OSError as error:
-            if error.errno != errno.EXDEV:
-                raise
-            shutil.copy2(source, destination)
-            source.unlink()
+
+
+def _move_cache_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        source.replace(destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        shutil.copy2(source, destination, follow_symlinks=False)
+        source.unlink()
 
 
 def repository_from_uri(uri: str) -> str:

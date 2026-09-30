@@ -24,7 +24,10 @@ the GitHub repository as follows:
   according to GitHub's limits
 
 The `pull` command mirrors the contents of the GitHub repository to the local
-`PKGDIR`.
+`PKGDIR`. If replacing the cache fails, the previous files are restored. If
+restoration also fails, the error identifies a retained `.binrepo-backup-*`
+directory inside `PKGDIR`; recover its files before removing it and retrying.
+Cache replacement is not atomic across a process crash or power loss.
 
 ## Usage
 

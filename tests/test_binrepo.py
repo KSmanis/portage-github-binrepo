@@ -1126,7 +1126,10 @@ def test_private_index_pull_preserves_slashes_in_branch(tmp_path: Path) -> None:
     assert destination.read_bytes() == b"PACKAGES: 0\n\n"
 
 
-def test_pull_all_replaces_local_cache_with_remote(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fail_replacement", (False, True))
+def test_pull_all_replaces_local_cache_with_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_replacement: bool
+) -> None:
     package = "cat/pkg/pkg-1.gpkg.tar"
     content = b"remote package"
     remote = make_remote_packages(package, sizes={package: len(content)})
@@ -1150,6 +1153,26 @@ def test_pull_all_replaces_local_cache_with_remote(tmp_path: Path) -> None:
     )
     (tmp_path / "Packages.gz").write_bytes(b"stale")
 
+    if fail_replacement:
+        old_index = (tmp_path / "Packages").read_bytes()
+        replace = Path.replace
+
+        def failing_replace(source: Path, destination: Path) -> Path:
+            if source.name == "pkg-1.gpkg.tar":
+                raise OSError(errno.EIO, "installation failed")
+            return replace(source, destination)
+
+        monkeypatch.setattr(Path, "replace", failing_replace)
+        with pytest.raises(OSError, match="installation failed"):
+            pull.pull_locked(client, tmp_path)
+        assert (tmp_path / "Packages").read_bytes() == old_index
+        assert (tmp_path / old_package).read_bytes() == b"old"
+        assert (tmp_path / "Packages.gz").read_bytes() == b"stale"
+        assert not (tmp_path / package).exists()
+        assert not list(tmp_path.glob(".binrepo-backup-*"))
+        assert not list(tmp_path.parent.glob(f".{tmp_path.name}.*"))
+        return
+
     pull.pull_locked(client, tmp_path)
 
     entries = package_module.parse_packages(
@@ -1163,6 +1186,134 @@ def test_pull_all_replaces_local_cache_with_remote(tmp_path: Path) -> None:
     client.get_content.assert_called_once_with("Packages", "binrepo")
 
 
+@pytest.fixture
+def cache_replacement(tmp_path: Path) -> tuple[Path, Path]:
+    pkgdir = tmp_path / "pkgdir"
+    staging = tmp_path / "staging"
+    (pkgdir / "cat/old").mkdir(parents=True)
+    (pkgdir / "cat/old/old-1.gpkg.tar").write_bytes(b"old package")
+    (pkgdir / "Packages").write_bytes(b"old index")
+    (pkgdir / "Packages.portage_lockfile").write_bytes(b"lock")
+    (pkgdir / "cat/pkg").symlink_to("old", target_is_directory=True)
+    (staging / "cat/pkg").mkdir(parents=True)
+    (staging / "cat/pkg/pkg-1.gpkg.tar").write_bytes(b"new package")
+    (staging / "Packages").write_bytes(b"new index")
+    return pkgdir, staging
+
+
+@pytest.mark.parametrize("phase", ("backup", "install"))
+@pytest.mark.parametrize("failure_number", (1, 2))
+@pytest.mark.parametrize("cross_device", (False, True))
+def test_replace_cache_restores_files_after_failure(
+    cache_replacement: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    failure_number: int,
+    cross_device: bool,
+) -> None:
+    pkgdir, staging = cache_replacement
+    root_inode = pkgdir.stat().st_ino
+    lock = pkgdir / "Packages.portage_lockfile"
+    lock_inode = lock.stat().st_ino
+    replace = Path.replace
+    copy = pull.shutil.copy2
+    operations = 0
+
+    def should_fail(source: Path) -> bool:
+        nonlocal operations
+        selected = (
+            source.is_relative_to(staging)
+            if phase == "install"
+            else (
+                source.is_relative_to(pkgdir)
+                and not any(
+                    part.startswith(".binrepo-backup-") for part in source.parts
+                )
+            )
+        )
+        if selected:
+            operations += 1
+            return operations == failure_number
+        return False
+
+    def failing_replace(source: Path, destination: Path) -> Path:
+        if cross_device:
+            raise OSError(errno.EXDEV, "cross-device move")
+        if should_fail(source):
+            raise OSError(errno.EIO, "replacement failed")
+        return replace(source, destination)
+
+    def failing_copy(
+        source: Path, destination: Path, *, follow_symlinks: bool
+    ) -> Path | str:
+        if should_fail(source):
+            destination.write_bytes(b"partial copy")
+            raise OSError(errno.ENOSPC, "replacement failed")
+        return copy(source, destination, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    if cross_device:
+        monkeypatch.setattr(pull.shutil, "copy2", failing_copy)
+
+    with pytest.raises(OSError, match="replacement failed"):
+        pull._replace_cache(pkgdir, staging)
+
+    assert (pkgdir / "Packages").read_bytes() == b"old index"
+    assert (pkgdir / "cat/old/old-1.gpkg.tar").read_bytes() == b"old package"
+    assert (pkgdir / "cat/pkg").is_symlink()
+    assert (pkgdir / "cat/pkg").readlink() == Path("old")
+    assert not (pkgdir / "cat/pkg/pkg-1.gpkg.tar").exists()
+    assert not list(pkgdir.glob(".binrepo-backup-*"))
+    assert pkgdir.stat().st_ino == root_inode
+    assert lock.stat().st_ino == lock_inode
+    assert lock.read_bytes() == b"lock"
+
+
+def test_replace_cache_retains_backup_when_rollback_fails(
+    cache_replacement: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pkgdir, staging = cache_replacement
+    replace = Path.replace
+
+    def failing_replace(source: Path, destination: Path) -> Path:
+        if source.is_relative_to(staging):
+            raise OSError(errno.EIO, "installation failed")
+        if any(part.startswith(".binrepo-backup-") for part in source.parts):
+            raise OSError(errno.EIO, "rollback failed")
+        return replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="rollback failed") as raised:
+        pull._replace_cache(pkgdir, staging)
+
+    (backup,) = pkgdir.glob(".binrepo-backup-*")
+    assert (backup / "Packages").read_bytes() == b"old index"
+    assert (backup / "cat/old/old-1.gpkg.tar").read_bytes() == b"old package"
+    assert raised.value.__notes__ == [f"Cache backup retained at {backup}"]
+    with pytest.raises(FileExistsError, match="Recover retained cache backup"):
+        pull._replace_cache(pkgdir, staging)
+    assert (backup / "Packages").read_bytes() == b"old index"
+
+
+def test_replace_cache_keeps_directory_and_lock_on_success(
+    cache_replacement: tuple[Path, Path],
+) -> None:
+    pkgdir, staging = cache_replacement
+    root_inode = pkgdir.stat().st_ino
+    lock = pkgdir / "Packages.portage_lockfile"
+    lock_inode = lock.stat().st_ino
+
+    pull._replace_cache(pkgdir, staging)
+
+    assert (pkgdir / "Packages").read_bytes() == b"new index"
+    assert (pkgdir / "cat/pkg/pkg-1.gpkg.tar").read_bytes() == b"new package"
+    assert not (pkgdir / "cat/old").exists()
+    assert not list(pkgdir.glob(".binrepo-backup-*"))
+    assert pkgdir.stat().st_ino == root_inode
+    assert lock.stat().st_ino == lock_inode
+
+
 def test_replace_cache_copies_across_filesystems(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1172,7 +1323,6 @@ def test_replace_cache_copies_across_filesystems(
     package.parent.mkdir(parents=True)
     package.write_bytes(b"package")
     (staging / "Packages").write_bytes(b"index")
-    pkgdir.mkdir()
 
     def cross_device_replace(_source: Path, _destination: Path) -> None:
         raise OSError(errno.EXDEV, "Invalid cross-device link")
