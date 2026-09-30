@@ -150,27 +150,76 @@ def pull_locked(
 
 
 def _replace_cache(pkgdir: Path, staging: Path) -> None:
+    pkgdir.mkdir(parents=True, exist_ok=True)
+    backup_prefix = f".{pkgdir.name}.binrepo-backup-"
+    for retained in pkgdir.parent.glob(f"{backup_prefix}*"):
+        raise FileExistsError(  # noqa: TRY003
+            f"Recover retained cache backup before pulling: {retained}"
+        )
+    paths = [
+        path
+        for path in pkgdir.rglob("*")
+        if (path.is_symlink() or path.is_file())
+        and not path.name.endswith(".portage_lockfile")
+    ]
+    backup = Path(tempfile.mkdtemp(dir=pkgdir.parent, prefix=backup_prefix))
+    saved: list[Path] = []
+    installed: list[Path] = []
+    try:
+        for path in paths:
+            relative = path.relative_to(pkgdir)
+            _move_cache_file(path, backup / relative)
+            saved.append(relative)
+        for source in staging.rglob("*"):
+            if not source.is_file():
+                continue
+            destination = pkgdir / source.relative_to(staging)
+            # A failed cross-filesystem copy can leave a partial destination.
+            installed.append(destination)
+            _move_cache_file(source, destination)
+    except BaseException:
+        try:
+            for destination in reversed(installed):
+                # A failed rename may have collided with an existing directory.
+                if destination.is_dir() and not destination.is_symlink():
+                    continue
+                destination.unlink(missing_ok=True)
+            _remove_empty_cache_directories(pkgdir)
+            for relative in saved:
+                _move_cache_file(backup / relative, pkgdir / relative)
+        except BaseException as error:
+            raise OSError(  # noqa: TRY003
+                f"Cache restoration failed; backup retained at {backup}: {error}"
+            ) from error
+        shutil.rmtree(backup)
+        raise
+    try:
+        shutil.rmtree(backup)
+    except OSError as error:
+        raise OSError(  # noqa: TRY003
+            f"New cache installed, but backup cleanup failed at {backup}; "
+            f"remove the retained backup before retrying: {error}"
+        ) from error
+    _remove_empty_cache_directories(pkgdir)
+
+
+def _remove_empty_cache_directories(pkgdir: Path) -> None:
     for path in sorted(
         pkgdir.rglob("*"), key=lambda item: len(item.parts), reverse=True
     ):
-        if path.name.endswith(".portage_lockfile"):
-            continue
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.is_dir():
+        if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
             path.rmdir()
-    for source in staging.rglob("*"):
-        if not source.is_file():
-            continue
-        destination = pkgdir / source.relative_to(staging)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            source.replace(destination)
-        except OSError as error:
-            if error.errno != errno.EXDEV:
-                raise
-            shutil.copy2(source, destination)
-            source.unlink()
+
+
+def _move_cache_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        source.replace(destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        shutil.copy2(source, destination, follow_symlinks=False)
+        source.unlink()
 
 
 def repository_from_uri(uri: str) -> str:
