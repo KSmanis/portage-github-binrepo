@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         if token is None:
             return 0
         client = GitHubClient(repository, token)
-        _dispatch(client, args, branch)
+        _dispatch(client, args, repository, branch)
     except (GitHubError, OSError, ValueError) as error:
         print(f"portage-github-binrepo: {error}", file=sys.stderr)
         return 1
@@ -138,17 +138,19 @@ def _read_token_for_command(args: argparse.Namespace, path: str | Path) -> str |
         return None
 
 
-def _dispatch(client: GitHubClient, args: argparse.Namespace, branch: str) -> None:
+def _dispatch(
+    client: GitHubClient, args: argparse.Namespace, repository: str, branch: str
+) -> None:
     if args.command == "init":
         result = init_repository(client, private=not args.public, branch=branch)
         print(
-            f"repository={client.repository} created={str(result['created']).lower()} "
+            f"repository={repository} created={str(result['created']).lower()} "
             f"private={str(result['private']).lower()} default_branch={result['default_branch']}"
         )
     elif args.command == "check":
         result = check_repository(client, read_only=args.read_only, branch=branch)
         print(
-            f"repository={client.repository}"
+            f"repository={repository}"
             f" access={result['access']}"
             f" private={str(result['private']).lower()}"
             f" default_branch={result['default_branch']}"
