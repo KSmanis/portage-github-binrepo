@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import errno
+import gzip
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -86,22 +88,31 @@ def test_missing_remote_index_preserves_destination(tmp_path: Path) -> None:
     assert destination.read_bytes() == b"existing"
 
 
-def test_failed_pull_preserves_cache_and_releases_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "failed_asset",
+    (None, 9, 10),
+    ids=("success", "first-download-fails", "second-download-fails"),
+)
+def test_pull_locked_stages_downloads_before_replacing_cache(
+    failed_asset: int | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pkgdir = tmp_path / "pkgdir"
     pkgdir.mkdir()
-    old_index = make_packages("cat/old/old-1.gpkg.tar")
-    write_pkgdir(pkgdir, old_index, {"cat/old/old-1.gpkg.tar": b"old"})
+    old_package = "cat/old/old-1.gpkg.tar"
+    old_index = make_packages(old_package, sizes={old_package: 3})
+    write_pkgdir(pkgdir, old_index, {old_package: b"old"})
     (pkgdir / "Packages.gz").write_bytes(b"old gzip index")
-    remote = make_remote_packages("cat/one/one-1.gpkg.tar", "cat/two/two-2.gpkg.tar")
+    paths = ("cat/one/one-1.gpkg.tar", "cat/two/two-2.gpkg.tar")
+    remote = make_remote_packages(*paths)
     client = Mock(repository="owner/repo")
+    client.check.return_value = {"initialized": True}
+    client.get_content.return_value = {"sha": "index"}
     client.content_bytes.return_value = remote.encode()
 
     def download(asset_id: int, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(b"downloaded" if asset_id == 9 else b"partial")
-        if asset_id == 10:
+        destination.write_bytes(b"x" * (asset_id - 8))
+        if asset_id == failed_asset:
             raise github.GitHubError("download failed")  # noqa: TRY003
 
     client.download_asset.side_effect = download
@@ -110,16 +121,32 @@ def test_failed_pull_preserves_cache_and_releases_lock(
     unlockfile = Mock()
     monkeypatch.setattr(pull, "lockfile", lockfile)
     monkeypatch.setattr(pull, "unlockfile", unlockfile)
+    expectation = (
+        nullcontext()
+        if failed_asset is None
+        else pytest.raises(github.GitHubError, match="download failed")
+    )
 
-    with pytest.raises(github.GitHubError, match="download failed"):
+    with expectation:
         pull.pull_locked(client, pkgdir)
 
-    assert (pkgdir / "Packages").read_text(encoding="utf-8") == old_index
-    assert (pkgdir / "Packages.gz").read_bytes() == b"old gzip index"
-    assert (pkgdir / "cat/old/old-1.gpkg.tar").read_bytes() == b"old"
-    assert not (pkgdir / "cat/one").exists()
+    if failed_asset is None:
+        assert list(package.parse_packages((pkgdir / "Packages").read_text())) == list(
+            paths
+        )
+        for index, path in enumerate(paths, 1):
+            assert (pkgdir / path).read_bytes() == b"x" * index
+        assert not (pkgdir / old_package).exists()
+        assert not (pkgdir / "Packages.gz").exists()
+    else:
+        assert (pkgdir / "Packages").read_text(encoding="utf-8") == old_index
+        assert (pkgdir / "Packages.gz").read_bytes() == b"old gzip index"
+        assert (pkgdir / old_package).read_bytes() == b"old"
+        assert all(not (pkgdir / path).exists() for path in paths)
     assert list(tmp_path.iterdir()) == [pkgdir]
-    assert client.download_asset.call_count == 2
+    assert client.download_asset.call_count == (1 if failed_asset == 9 else 2)
+    client.check.assert_called_once_with(write=False, branch="binrepo")
+    client.get_content.assert_called_once_with("Packages", "binrepo")
     lockfile.assert_called_once_with(str(pkgdir / "Packages"), wantnewlockfile=True)
     unlockfile.assert_called_once_with(lock)
 
@@ -169,26 +196,42 @@ def test_cache_replacement_preserves_lock_and_unlinks_symlinks(tmp_path: Path) -
     assert (outside / "package").read_bytes() == b"untouched"
 
 
-def test_cache_replacement_propagates_non_cross_device_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "error", (errno.EXDEV, errno.EACCES), ids=("cross-device", "permission-denied")
+)
+def test_cache_replacement_handles_move_errors(
+    error: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pkgdir = tmp_path / "pkgdir"
     staging = tmp_path / "staging"
     pkgdir.mkdir()
-    staging.mkdir()
-    source = staging / "Packages"
-    source.write_bytes(b"index")
+    source = staging / "cat/pkg/pkg-1.gpkg.tar"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"package")
+    (staging / "Packages").write_bytes(b"index")
 
-    def denied(_source: Path, _destination: Path) -> None:
-        raise PermissionError(errno.EACCES, "denied")
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError(error, "move failed")
 
-    monkeypatch.setattr(Path, "replace", denied)
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    expectation = (
+        nullcontext()
+        if error == errno.EXDEV
+        else pytest.raises(OSError, match="move failed")
+    )
 
-    with pytest.raises(PermissionError, match="denied"):
+    with expectation:
         pull._replace_cache(pkgdir, staging)
 
-    assert source.read_bytes() == b"index"
-    assert not (pkgdir / "Packages").exists()
+    if error == errno.EXDEV:
+        assert (pkgdir / "cat/pkg/pkg-1.gpkg.tar").read_bytes() == b"package"
+        assert (pkgdir / "Packages").read_bytes() == b"index"
+        assert not source.exists()
+        assert not (staging / "Packages").exists()
+    else:
+        assert source.read_bytes() == b"package"
+        assert (staging / "Packages").read_bytes() == b"index"
+        assert not (pkgdir / "Packages").exists()
 
 
 @pytest.mark.parametrize(
@@ -197,3 +240,31 @@ def test_cache_replacement_propagates_non_cross_device_error(
 def test_repository_inference_rejects_unsupported_uri(uri: str) -> None:
     with pytest.raises(ValueError, match="unsupported binrepo URI"):
         pull.repository_from_uri(uri)
+
+
+@pytest.mark.parametrize("name", ("Packages", "Packages.gz"))
+@pytest.mark.parametrize(
+    "branch", ("host", "release/current"), ids=("simple-branch", "nested-branch")
+)
+def test_private_index_pull_preserves_branch_and_compression(
+    name: str, branch: str, tmp_path: Path
+) -> None:
+    packages = make_packages("cat/pkg/file")
+    client = Mock(repository="owner/repo")
+    client.get_ref.return_value = {"object": {"sha": "root"}}
+    client.get_content.return_value = {"sha": "index"}
+    client.content_bytes.return_value = packages.encode()
+    destination = tmp_path / name
+
+    pull.pull(
+        client,
+        f"https://raw.githubusercontent.com/owner/repo/{branch}/{name}",
+        destination,
+    )
+
+    client.get_ref.assert_called_once_with(f"heads/{branch}")
+    client.get_content.assert_called_once_with("Packages", branch)
+    data = destination.read_bytes()
+    if name.endswith(".gz"):
+        data = gzip.decompress(data)
+    assert data.decode() == packages

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
@@ -31,16 +32,47 @@ def http() -> Iterator[responses.RequestsMock]:
         yield mock
 
 
-def test_safe_request_retries_transient_response(http: responses.RequestsMock) -> None:
-    http.get(f"{API}/resource", json=["busy"], status=503)
-    http.get(f"{API}/resource", json={"ok": True})
+@pytest.mark.parametrize(
+    ("method", "failures", "delays"),
+    (
+        pytest.param("GET", (503,), [1], id="transient-response"),
+        pytest.param(
+            "GET",
+            (requests.ConnectionError("disconnected"), requests.Timeout("timed out")),
+            [1, 2],
+            id="get-transport-failures",
+        ),
+        pytest.param(
+            "HEAD",
+            (requests.ConnectionError("disconnected"), requests.Timeout("timed out")),
+            [1, 2],
+            id="head-transport-failures",
+        ),
+    ),
+)
+def test_safe_request_retries(
+    http: responses.RequestsMock,
+    method: str,
+    failures: tuple[int | requests.RequestException, ...],
+    delays: list[int],
+) -> None:
+    for failure in failures:
+        if isinstance(failure, int):
+            http.add(method, f"{API}/resource", json=["busy"], status=failure)
+        else:
+            http.add(method, f"{API}/resource", body=failure)
+    http.add(method, f"{API}/resource", json={"ok": True} if method == "GET" else None)
     sleeps = []
     client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
 
-    assert client.json("GET", "/resource") == {"ok": True}
-    assert len(http.calls) == 2
-    assert sleeps == [1]
+    response = client.request(method, "/resource")
+
+    assert response.status_code == 200
+    assert len(http.calls) == len(failures) + 1
+    assert sleeps == delays
     assert http.calls[0].request.headers["Authorization"] == "Bearer secret"
+    if method == "GET":
+        assert response.json() == {"ok": True}
 
 
 @pytest.mark.parametrize(
@@ -153,14 +185,23 @@ def test_delete_asset_accepts_not_found_after_retry(
     assert sleeps == [1]
 
 
-def test_non_idempotent_request_is_not_retried(http: responses.RequestsMock) -> None:
-    http.post(f"{API}/resource", json={"message": "busy"}, status=503)
-    client = github.GitHubClient("owner/repo", "secret")
+@pytest.mark.parametrize(
+    ("method", "status", "message"),
+    (("POST", 503, "busy"), ("GET", 403, "Resource not accessible")),
+    ids=("non-idempotent-error", "permission-denied"),
+)
+def test_unretryable_error_is_not_retried(
+    http: responses.RequestsMock, method: str, status: int, message: str
+) -> None:
+    http.add(method, f"{API}/resource", json={"message": message}, status=status)
+    sleeps = []
+    client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
 
-    with pytest.raises(github.GitHubError, match="returned 503"):
-        client.json("POST", "/resource", expected=(201,))
+    with pytest.raises(github.GitHubError, match=f"returned {status}: {message}"):
+        client.json(method, "/resource")
 
     assert len(http.calls) == 1
+    assert sleeps == []
 
 
 def test_json_rejects_empty_response(http: responses.RequestsMock) -> None:
@@ -185,32 +226,31 @@ def test_list_assets_follows_link_header(http: responses.RequestsMock) -> None:
     assert http.calls[1].request.url == second
 
 
+@pytest.mark.parametrize("ref_status", (200, 409), ids=("initialized", "empty"))
 def test_check_accepts_repository_without_user_permissions(
-    http: responses.RequestsMock,
+    http: responses.RequestsMock, ref_status: int
 ) -> None:
+    repo = f"{API}/repos/owner/repo"
+    http.get(repo, json={"private": True, "default_branch": "main"})
     http.get(
-        f"{API}/repos/owner/repo", json={"private": True, "default_branch": "main"}
-    )
-    http.get(
-        f"{API}/repos/owner/repo/git/ref/heads/binrepo",
-        json={"ref": "refs/heads/binrepo", "object": {"sha": "current"}},
+        f"{repo}/git/ref/heads/binrepo",
+        json={"ref": "refs/heads/binrepo", "object": {"sha": "current"}}
+        if ref_status == 200
+        else {},
+        status=ref_status,
     )
     client = github.GitHubClient("owner/repo", "secret")
 
-    assert client.check() == snapshot(
-        {
-            "private": True,
-            "default_branch": "main",
-            "access": "write",
-            "initialized": True,
-        }
-    )
-    assert [call.request.url for call in http.calls] == snapshot(
-        [
-            "https://api.github.com/repos/owner/repo",
-            "https://api.github.com/repos/owner/repo/git/ref/heads/binrepo",
-        ]
-    )
+    assert client.check() == {
+        "private": True,
+        "default_branch": "main",
+        "access": "write",
+        "initialized": ref_status == 200,
+    }
+    assert [call.request.url for call in http.calls] == [
+        repo,
+        f"{repo}/git/ref/heads/binrepo",
+    ]
 
 
 def test_empty_repository_ref_is_uninitialized(http: responses.RequestsMock) -> None:
@@ -224,52 +264,59 @@ def test_empty_repository_ref_is_uninitialized(http: responses.RequestsMock) -> 
     assert client.get_ref("heads/main") is None
 
 
-def test_check_accepts_empty_repository(http: responses.RequestsMock) -> None:
-    http.get(
-        f"{API}/repos/owner/repo", json={"private": True, "default_branch": "main"}
-    )
-    http.get(f"{API}/repos/owner/repo/git/ref/heads/binrepo", json={}, status=409)
-    client = github.GitHubClient("owner/repo", "secret")
-
-    assert client.check()["initialized"] is False
-
-
+@pytest.mark.parametrize(
+    "initialized", (False, True), ids=("empty-repository", "existing-default-branch")
+)
 def test_repository_initializes_orphan_binrepo_branch(
-    http: responses.RequestsMock, monkeypatch: pytest.MonkeyPatch
+    http: responses.RequestsMock, monkeypatch: pytest.MonkeyPatch, initialized: bool
 ) -> None:
     monkeypatch.setattr(getbinpkg.time, "time", lambda: 123)
     repo = f"{API}/repos/owner/repo"
-    http.get(f"{repo}/git/ref/heads/binrepo", json={}, status=409)
-    http.get(f"{repo}/git/ref/heads/main", json={}, status=409)
-    http.put(
-        f"{repo}/contents/README.md", json={"content": {"sha": "bootstrap"}}, status=201
+    http.get(
+        f"{repo}/git/ref/heads/binrepo", json={}, status=404 if initialized else 409
     )
+    http.get(
+        f"{repo}/git/ref/heads/main",
+        json={"ref": "refs/heads/main"} if initialized else {},
+        status=200 if initialized else 409,
+    )
+    if not initialized:
+        http.put(
+            f"{repo}/contents/README.md",
+            json={"content": {"sha": "bootstrap"}},
+            status=201,
+        )
     http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
     http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
     http.post(f"{repo}/git/refs", json={"ref": "refs/heads/binrepo"}, status=201)
     client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
 
-    client.initialize_repository("main")
+    assert client.initialize_repository("main") == {"ref": "refs/heads/binrepo"}
 
-    assert [(call.request.method, call.request.url) for call in http.calls] == snapshot(
-        [
-            ("GET", "https://api.github.com/repos/owner/repo/git/ref/heads/binrepo"),
-            ("GET", "https://api.github.com/repos/owner/repo/git/ref/heads/main"),
-            ("PUT", "https://api.github.com/repos/owner/repo/contents/README.md"),
-            ("POST", "https://api.github.com/repos/owner/repo/git/trees"),
-            ("POST", "https://api.github.com/repos/owner/repo/git/commits"),
-            ("POST", "https://api.github.com/repos/owner/repo/git/refs"),
-        ]
-    )
-    bootstrap_body = request_json(http.calls[2].request)
-    assert isinstance(bootstrap_body, dict)
-    assert bootstrap_body["message"] == snapshot("Initialize repo")
-    bootstrap_content = bootstrap_body["content"]
-    assert isinstance(bootstrap_content, str)
-    assert "sync-uri = https://raw.githubusercontent.com/owner/repo/binrepo" in (
-        base64.b64decode(bootstrap_content).decode()
-    )
-    assert request_json(http.calls[3].request) == snapshot(
+    assert [(call.request.method, call.request.url) for call in http.calls] == [
+        ("GET", f"{repo}/git/ref/heads/binrepo"),
+        ("GET", f"{repo}/git/ref/heads/main"),
+        *([] if initialized else [("PUT", f"{repo}/contents/README.md")]),
+        ("POST", f"{repo}/git/trees"),
+        ("POST", f"{repo}/git/commits"),
+        ("POST", f"{repo}/git/refs"),
+    ]
+    bodies = {
+        call.request.url: request_json(call.request)
+        for call in http.calls
+        if call.request.method in {"PUT", "POST"}
+    }
+    if not initialized:
+        bootstrap = bodies[f"{repo}/contents/README.md"]
+        assert isinstance(bootstrap, dict)
+        assert bootstrap["message"] == "Initialize repo"
+        content = bootstrap["content"]
+        assert isinstance(content, str)
+        assert (
+            "sync-uri = https://raw.githubusercontent.com/owner/repo/binrepo"
+            in base64.b64decode(content).decode()
+        )
+    assert bodies[f"{repo}/git/trees"] == snapshot(
         {
             "tree": [
                 {
@@ -281,10 +328,10 @@ def test_repository_initializes_orphan_binrepo_branch(
             ]
         }
     )
-    assert request_json(http.calls[4].request) == snapshot(
+    assert bodies[f"{repo}/git/commits"] == snapshot(
         {"message": "Initialize binrepo", "tree": "tree", "parents": []}
     )
-    assert request_json(http.calls[5].request) == snapshot(
+    assert bodies[f"{repo}/git/refs"] == snapshot(
         {"ref": "refs/heads/binrepo", "sha": "commit"}
     )
 
@@ -302,85 +349,50 @@ def test_repository_with_existing_binrepo_branch_is_not_initialized(
     assert len(http.calls) == 1
 
 
-def test_repository_adds_binrepo_branch_without_changing_default_branch(
-    http: responses.RequestsMock,
+@pytest.mark.parametrize(
+    "applied", (False, True), ids=("failed-bootstrap", "lost-response")
+)
+def test_repository_reconciles_bootstrap_failure(
+    http: responses.RequestsMock, applied: bool
 ) -> None:
     repo = f"{API}/repos/owner/repo"
     http.get(f"{repo}/git/ref/heads/binrepo", json={}, status=404)
-    http.get(f"{repo}/git/ref/heads/main", json={"ref": "refs/heads/main"})
-    http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
-    http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
-    http.post(f"{repo}/git/refs", json={"ref": "refs/heads/binrepo"}, status=201)
-    client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
-
-    client.initialize_repository("main")
-
-    assert [call.request.method for call in http.calls] == [
-        "GET",
-        "GET",
-        "POST",
-        "POST",
-        "POST",
-    ]
-
-
-def test_repository_recovers_lost_readme_response(http: responses.RequestsMock) -> None:
-    repo = f"{API}/repos/owner/repo"
-    http.get(f"{repo}/git/ref/heads/binrepo", json={}, status=404)
-    http.get(f"{repo}/git/ref/heads/main", json={}, status=409)
-    http.put(
-        f"{repo}/contents/README.md", body=requests.ConnectionError("response lost")
-    )
-    http.get(f"{repo}/git/ref/heads/main", json={"ref": "refs/heads/main"})
-    http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
-    http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
-    http.post(f"{repo}/git/refs", json={"ref": "refs/heads/binrepo"}, status=201)
-    client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
-
-    assert client.initialize_repository("main") == {"ref": "refs/heads/binrepo"}
-
-
-def test_repository_recovers_lost_binrepo_ref_response(
-    http: responses.RequestsMock,
-) -> None:
-    repo = f"{API}/repos/owner/repo"
-    http.get(f"{repo}/git/ref/heads/binrepo", json={}, status=404)
-    http.get(f"{repo}/git/ref/heads/main", json={"ref": "refs/heads/main"})
-    http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
-    http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
-    http.post(f"{repo}/git/refs", body=requests.ConnectionError("response lost"))
-    http.get(
-        f"{repo}/git/ref/heads/binrepo",
-        json={"ref": "refs/heads/binrepo", "object": {"sha": "commit"}},
-    )
-    client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
-
-    assert client.initialize_repository("main") == {
-        "ref": "refs/heads/binrepo",
-        "object": {"sha": "commit"},
-    }
-
-
-def test_repository_initialization_propagates_failed_bootstrap(
-    http: responses.RequestsMock,
-) -> None:
-    repo = f"{API}/repos/owner/repo"
-    http.get(f"{repo}/git/ref/heads/binrepo", json={}, status=409)
     http.get(f"{repo}/git/ref/heads/main", json={}, status=409)
     http.put(
         f"{repo}/contents/README.md", body=requests.ConnectionError("bootstrap failed")
     )
+    http.get(
+        f"{repo}/git/ref/heads/main",
+        json={"ref": "refs/heads/main"} if applied else {},
+        status=200 if applied else 409,
+    )
+    if applied:
+        http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
+        http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
+        http.post(f"{repo}/git/refs", json={"ref": "refs/heads/binrepo"}, status=201)
     client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
+    expectation = (
+        nullcontext()
+        if applied
+        else pytest.raises(github.GitHubError, match="bootstrap failed")
+    )
 
-    with pytest.raises(github.GitHubError, match="bootstrap failed"):
-        client.initialize_repository("main")
+    with expectation:
+        assert client.initialize_repository("main") == {"ref": "refs/heads/binrepo"}
+    assert [call.request.method for call in http.calls] == [
+        "GET",
+        "GET",
+        "PUT",
+        "GET",
+        *(["POST"] * 3 if applied else []),
+    ]
 
-    assert [call.request.method for call in http.calls] == ["GET", "GET", "PUT", "GET"]
 
-
-@pytest.mark.parametrize("ref", ({}, {"object": {"sha": "other-commit"}}))
-def test_repository_initialization_does_not_accept_unrelated_ref(
-    http: responses.RequestsMock, ref: github.GitRef
+@pytest.mark.parametrize(
+    "sha", (None, "other-commit", "commit"), ids=("missing", "unrelated", "applied")
+)
+def test_repository_reconciles_ref_creation_failure(
+    http: responses.RequestsMock, sha: str | None
 ) -> None:
     repo = f"{API}/repos/owner/repo"
     http.get(f"{repo}/git/ref/heads/binrepo", json={}, status=404)
@@ -388,11 +400,19 @@ def test_repository_initialization_does_not_accept_unrelated_ref(
     http.post(f"{repo}/git/trees", json={"sha": "tree"}, status=201)
     http.post(f"{repo}/git/commits", json={"sha": "commit"}, status=201)
     http.post(f"{repo}/git/refs", body=requests.ConnectionError("ref creation failed"))
+    ref: github.GitRef = (
+        {"ref": "refs/heads/binrepo", "object": {"sha": sha}} if sha is not None else {}
+    )
     http.get(f"{repo}/git/ref/heads/binrepo", json=ref, status=200 if ref else 404)
     client = github.GitHubClient("owner/repo", "secret", sleep=Mock())
+    expectation = (
+        nullcontext()
+        if sha == "commit"
+        else pytest.raises(github.GitHubError, match="ref creation failed")
+    )
 
-    with pytest.raises(github.GitHubError, match="ref creation failed"):
-        client.initialize_repository("main")
+    with expectation:
+        assert client.initialize_repository("main") == ref
 
 
 def test_release_name_matches_tag_and_description_is_empty(
@@ -429,22 +449,6 @@ def test_asset_upload_addresses_release_by_index_id(
     assert http.calls[0].request.url == f"{url}?name=asset.gpkg.tar"
 
 
-@pytest.mark.parametrize("method", ("GET", "HEAD"))
-def test_safe_request_retries_transport_failure(
-    http: responses.RequestsMock, method: str
-) -> None:
-    http.add(method, f"{API}/resource", body=requests.ConnectionError("disconnected"))
-    http.add(method, f"{API}/resource", body=requests.Timeout("timed out"))
-    http.add(method, f"{API}/resource", status=200)
-    sleeps = []
-    client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
-
-    assert client.request(method, "/resource").status_code == 200
-
-    assert len(http.calls) == 3
-    assert sleeps == [1, 2]
-
-
 def test_transport_retries_are_bounded(http: responses.RequestsMock) -> None:
     http.get(f"{API}/resource", body=requests.Timeout("timed out"))
     sleeps = []
@@ -457,20 +461,6 @@ def test_transport_retries_are_bounded(http: responses.RequestsMock) -> None:
 
     assert len(http.calls) == 3
     assert sleeps == [1, 2]
-
-
-def test_permission_denial_is_not_retried(http: responses.RequestsMock) -> None:
-    http.get(f"{API}/resource", json={"message": "Resource not accessible"}, status=403)
-    sleeps = []
-    client = github.GitHubClient("owner/repo", "secret", sleep=sleeps.append)
-
-    with pytest.raises(
-        github.GitHubError, match="returned 403: Resource not accessible"
-    ):
-        client.request("GET", "/resource")
-
-    assert len(http.calls) == 1
-    assert sleeps == []
 
 
 @pytest.mark.parametrize("body", ("", "upstream failure" * 100))
@@ -576,51 +566,64 @@ def test_content_read_uses_requested_branch(
     )
 
 
-def test_content_bytes_decodes_inline_content(http: responses.RequestsMock) -> None:
-    client = github.GitHubClient("owner/repo", "secret")
-
-    assert (
-        client.content_bytes({"encoding": "base64", "content": "aW5k\nZXg="})
-        == b"index"
-    )
-
-    assert not http.calls
-
-
-@pytest.mark.parametrize("encoding", ("base64", "none"))
-def test_content_bytes_fetches_blob_when_content_is_omitted(
-    http: responses.RequestsMock, encoding: str
+@pytest.mark.parametrize(
+    "content",
+    (
+        pytest.param({"encoding": "base64", "content": "aW5k\nZXg="}, id="inline"),
+        pytest.param(
+            {
+                "encoding": "base64",
+                "content": "",
+                "git_url": f"{API}/repos/owner/repo/git/blobs/sha",
+            },
+            id="empty-inline",
+        ),
+        pytest.param(
+            {
+                "encoding": "none",
+                "content": "",
+                "git_url": f"{API}/repos/owner/repo/git/blobs/sha",
+            },
+            id="omitted-inline",
+        ),
+    ),
+)
+def test_content_bytes_reads_inline_or_blob_content(
+    http: responses.RequestsMock, content: github.Content
 ) -> None:
-    url = f"{API}/repos/owner/repo/git/blobs/sha"
-    http.get(url, json={"encoding": "base64", "content": "aW5kZXg="})
+    if "git_url" in content:
+        http.get(content["git_url"], json={"encoding": "base64", "content": "aW5kZXg="})
     client = github.GitHubClient("owner/repo", "secret")
 
-    assert (
-        client.content_bytes({"encoding": encoding, "content": "", "git_url": url})
-        == b"index"
-    )
+    assert client.content_bytes(content) == b"index"
 
-    assert len(http.calls) == 1
+    assert len(http.calls) == (1 if "git_url" in content else 0)
 
 
-def test_content_bytes_requires_blob_url(http: responses.RequestsMock) -> None:
-    client = github.GitHubClient("owner/repo", "secret")
-
-    with pytest.raises(github.GitHubError, match="content or a blob URL"):
-        client.content_bytes({"encoding": "none"})
-
-    assert not http.calls
-
-
-def test_content_bytes_rejects_unsupported_blob_encoding(
-    http: responses.RequestsMock,
+@pytest.mark.parametrize(
+    ("content", "message"),
+    (
+        pytest.param(
+            {"encoding": "none"}, "content or a blob URL", id="missing-blob-url"
+        ),
+        pytest.param(
+            {"git_url": f"{API}/repos/owner/repo/git/blobs/sha"},
+            "unsupported blob encoding",
+            id="unsupported-encoding",
+        ),
+    ),
+)
+def test_content_bytes_rejects_unavailable_content(
+    http: responses.RequestsMock, content: github.Content, message: str
 ) -> None:
-    url = f"{API}/repos/owner/repo/git/blobs/sha"
-    http.get(url, json={"encoding": "utf-8", "content": "index"})
+    if "git_url" in content:
+        http.get(content["git_url"], json={"encoding": "utf-8", "content": "index"})
     client = github.GitHubClient("owner/repo", "secret")
 
-    with pytest.raises(github.GitHubError, match="unsupported blob encoding"):
-        client.content_bytes({"git_url": url})
+    with pytest.raises(github.GitHubError, match=message):
+        client.content_bytes(content)
+
+    assert len(http.calls) == (1 if "git_url" in content else 0)
 
 
 @pytest.mark.parametrize("missing", (False, True))

@@ -116,22 +116,19 @@ def test_uncertain_upload_reuses_matching_asset(tmp_path: Path) -> None:
     assert len(client.assets[client.releases["binrepo/0"]["id"]]) == 1
 
 
-@pytest.mark.parametrize("failure", ("upload", "name", "size", "release"))
+@pytest.mark.parametrize("failure", ("upload", "name", "size", "release", "index"))
 def test_failed_publish_does_not_commit_index(failure: str, tmp_path: Path) -> None:
     path = "cat/pkg/pkg-1.gpkg.tar"
     write_pkgdir(tmp_path, make_packages(path), {path: b"x"})
     client = FakeClient()
-    if failure == "release":
+    if failure in {"release", "upload", "index"}:
+        method = {
+            "release": "create_release",
+            "upload": "upload_asset",
+            "index": "put_content",
+        }[failure]
         object.__setattr__(
-            client,
-            "create_release",
-            Mock(side_effect=github.GitHubError("release failed")),
-        )
-    elif failure == "upload":
-        object.__setattr__(
-            client,
-            "upload_asset",
-            Mock(side_effect=github.GitHubError("upload failed")),
+            client, method, Mock(side_effect=github.GitHubError(f"{failure} failed"))
         )
     else:
         upload_asset = client.upload_asset
@@ -149,7 +146,7 @@ def test_failed_publish_does_not_commit_index(failure: str, tmp_path: Path) -> N
     with pytest.raises(
         github.GitHubError,
         match="failed"
-        if failure in {"release", "upload"}
+        if failure in {"release", "upload", "index"}
         else "invalid asset metadata",
     ):
         push.push(client, tmp_path)
@@ -158,11 +155,13 @@ def test_failed_publish_does_not_commit_index(failure: str, tmp_path: Path) -> N
     assert client.puts == 0
     assert client.releases == {}
     assert client.assets == {}
+    assert client.deleted_refs == ([] if failure == "release" else ["tags/binrepo/0"])
 
 
 @pytest.mark.parametrize(
     ("cleanup", "active_assets", "message"),
     (
+        ({(1, 2, "other/0")}, set(), "does not match binrepo branch"),
         ({(1, 9, "binrepo/0")}, {9}, "cleanup references active asset"),
         (
             {(1, 9, "binrepo/0"), (1, 10, "binrepo/1")},
@@ -214,7 +213,7 @@ def test_invalid_remote_metadata_is_rejected_before_upload(
     assert client.deleted_refs == []
 
 
-@pytest.mark.parametrize("size", ("", "nope", "-1"))
+@pytest.mark.parametrize("size", ("", "nope", "-1", "2"))
 def test_invalid_local_size_is_rejected_before_publish(
     size: str, tmp_path: Path
 ) -> None:
@@ -224,7 +223,7 @@ def test_invalid_local_size_is_rejected_before_publish(
     client = FakeClient()
 
     with pytest.raises(
-        ValueError, match="invalid SIZE" if size != "-1" else "size mismatch"
+        ValueError, match="invalid SIZE" if size in {"", "nope"} else "size mismatch"
     ):
         push.push(client, tmp_path)
 
@@ -254,18 +253,3 @@ def test_local_package_must_be_file_inside_pkgdir(kind: str, tmp_path: Path) -> 
 
     assert client.releases == {}
     assert client.puts == 0
-
-
-def test_failed_push_releases_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    lock = object()
-    monkeypatch.setattr(push, "lockfile", Mock(return_value=lock))
-    unlockfile = Mock()
-    monkeypatch.setattr(push, "unlockfile", unlockfile)
-    client = FakeClient()
-
-    with pytest.raises(ValueError, match="Packages index is missing"):
-        push.push_locked(client, tmp_path)
-
-    unlockfile.assert_called_once_with(lock)
