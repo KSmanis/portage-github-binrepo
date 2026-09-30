@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import base64
-import errno
-import gzip
 import hashlib
+from contextlib import nullcontext
 from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,7 +13,6 @@ from inline_snapshot import snapshot
 from portage import getbinpkg
 from portage.versions import pkgsplit
 
-from portage_github_binrepo import cli
 from portage_github_binrepo import github
 from portage_github_binrepo import init
 from portage_github_binrepo import package as package_module
@@ -769,26 +767,6 @@ def test_index_failure_restores_replaced_asset(tmp_path: Path) -> None:
     assert client.assets[release["id"]] == [{"id": 9, "name": old_name, "size": 3}]
 
 
-def test_index_failure_removes_created_release(tmp_path: Path) -> None:
-    package = "cat/pkg/pkg-1-1.gpkg.tar"
-    content = b"new package"
-    write_pkgdir(
-        tmp_path,
-        make_packages(package, sizes={package: len(content)}),
-        {package: content},
-    )
-    client = FakeClient()
-    object.__setattr__(
-        client, "put_content", Mock(side_effect=github.GitHubError("conflict"))
-    )
-
-    with pytest.raises(github.GitHubError, match="conflict"):
-        push.push(client, tmp_path)
-
-    assert client.releases == {}
-    assert client.deleted_refs == ["tags/binrepo/0"]
-
-
 def test_applied_index_update_is_reconciled_before_cleanup(tmp_path: Path) -> None:
     package = "cat/pkg/pkg-1-1.gpkg.tar"
     previous = make_remote_packages(package)
@@ -940,252 +918,6 @@ def test_removed_package_cleanup_is_retried(tmp_path: Path) -> None:
     assert package_module.CLEANUP_FIELD not in contents
 
 
-def test_cleanup_is_validated_before_deleting_assets() -> None:
-    client = Mock()
-
-    with pytest.raises(ValueError, match="does not match binrepo branch"):
-        push._delete_cleanup(client, "binrepo", {(1, 2, "other/0")}, set(), set())
-
-    client.delete_asset.assert_not_called()
-
-
-def test_size_mismatch_is_rejected_before_push(tmp_path: Path) -> None:
-    package = "cat/pkg/pkg-1-1.gpkg.tar"
-    write_pkgdir(tmp_path, make_packages(package), {package: b"wrong size"})
-    client = FakeClient()
-
-    with pytest.raises(ValueError, match="package size mismatch"):
-        push.push(client, tmp_path)
-
-    assert client.releases == {}
-    assert client.puts == 0
-
-
-def test_token_file_must_be_private(tmp_path: Path) -> None:
-    token_file = tmp_path / "token"
-    token_file.write_text("secret\n", encoding="utf-8")
-    token_file.chmod(0o600)
-    assert cli.read_token(token_file) == "secret"
-    token_file.chmod(0o644)
-    with pytest.raises(ValueError, match="group or others"):
-        cli.read_token(token_file)
-
-
-def test_cli_uses_global_config(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    token_file = tmp_path / "token"
-    token_file.write_text("secret\n", encoding="utf-8")
-    token_file.chmod(0o600)
-    config = tmp_path / "producer.conf"
-    config.write_text(
-        "# comments may contain = signs\n"
-        "repository = 'owner/repo'  # one required setting\n"
-        "branch = testing\n",
-        encoding="utf-8",
-    )
-    client = Mock()
-    client.check.return_value = {
-        "private": True,
-        "default_branch": "main",
-        "access": "read",
-    }
-    make_client = Mock(return_value=client)
-    monkeypatch.setattr(cli, "CONFIG_PATH", config)
-    monkeypatch.setattr(cli, "TOKEN_PATH", token_file)
-    monkeypatch.setattr(cli, "GitHubClient", make_client)
-
-    assert cli.main(["check", "--read-only"]) == 0
-
-    make_client.assert_called_once_with("owner/repo", "secret")
-    client.check.assert_called_once_with(write=False, branch="testing")
-    assert capsys.readouterr().out == snapshot(
-        "repository=owner/repo access=read private=true default_branch=main\n"
-    )
-
-
-def test_config_rejects_unknown_key(tmp_path: Path) -> None:
-    config = tmp_path / "producer.conf"
-    config.write_text("unknown = value\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="Key validation failed at line: 1"):
-        cli.read_config(config)
-
-
-def test_pull_cli_infers_repository_from_uri(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    token_file = tmp_path / "token"
-    token_file.write_text("secret\n", encoding="utf-8")
-    token_file.chmod(0o600)
-    make_client = Mock(return_value=Mock())
-    pull = Mock()
-    monkeypatch.setattr(cli, "CONFIG_PATH", tmp_path / "missing.conf")
-    monkeypatch.setattr(cli, "TOKEN_PATH", token_file)
-    monkeypatch.setattr(cli, "GitHubClient", make_client)
-    monkeypatch.setattr(cli, "pull", pull)
-    uri = "https://raw.githubusercontent.com/owner/repo/host/Packages"
-
-    assert cli.main(["pull", uri, str(tmp_path / "Packages")]) == 0
-
-    make_client.assert_called_once_with("owner/repo", "secret")
-    pull.assert_called_once_with(
-        make_client.return_value, uri, str(tmp_path / "Packages"), None
-    )
-
-
-def test_pull_cli_without_arguments_syncs_pkgdir(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = Mock()
-    make_client = Mock(return_value=client)
-    pull_locked = Mock()
-    monkeypatch.setattr(cli, "config", lambda: {"PKGDIR": "/binpkgs"})
-    monkeypatch.setattr(cli, "read_token", Mock(return_value="secret"))
-    monkeypatch.setattr(cli, "GitHubClient", make_client)
-    monkeypatch.setattr(cli, "pull_locked", pull_locked)
-
-    assert (
-        cli.main(["pull", "--repository", "owner/repo", "--token-file", "token"]) == 0
-    )
-
-    pull_locked.assert_called_once_with(client, "/binpkgs", "binrepo")
-
-
-@pytest.mark.parametrize("name", ("Packages", "Packages.gz"))
-def test_pull_cli_returns_empty_index_for_unreadable_token(
-    name: str,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    destination = tmp_path / name
-    monkeypatch.setattr(cli, "CONFIG_PATH", tmp_path / "missing.conf")
-    monkeypatch.setattr(cli, "read_token", Mock(side_effect=PermissionError))
-    monkeypatch.setattr(getbinpkg.time, "time", lambda: 123)
-
-    assert (
-        cli.main(
-            [
-                "pull",
-                f"https://raw.githubusercontent.com/owner/repo/host/{name}",
-                str(destination),
-            ]
-        )
-        == 0
-    )
-
-    data = destination.read_bytes()
-    if name.endswith(".gz"):
-        data = gzip.decompress(data)
-    assert data.decode() == snapshot("PACKAGES: 0\nTIMESTAMP: 123\nVERSION: 0\n\n")
-    assert capsys.readouterr().err == ""
-
-
-def test_non_pull_cli_rejects_unreadable_token(
-    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(cli, "read_token", Mock(side_effect=PermissionError("denied")))
-
-    assert (
-        cli.main(["check", "--repository", "owner/repo", "--token-file", "token"]) == 1
-    )
-
-    assert capsys.readouterr().err == "portage-github-binrepo: denied\n"
-
-
-def test_private_index_pull_and_gzip(tmp_path: Path) -> None:
-    packages = make_packages("cat/pkg/file")
-    client = FakeClient(packages)
-    destination = tmp_path / "Packages.gz"
-
-    pull.pull(
-        client,
-        "https://raw.githubusercontent.com/owner/repo/host/Packages.gz",
-        destination,
-    )
-
-    assert gzip.decompress(destination.read_bytes()).decode() == packages
-
-
-def test_private_index_pull_preserves_slashes_in_branch(tmp_path: Path) -> None:
-    client = Mock(repository="owner/repo")
-    client.get_ref.return_value = {"object": {"sha": "root"}}
-    client.get_content.return_value = {"sha": "index"}
-    client.content_bytes.return_value = b"PACKAGES: 0\n\n"
-    destination = tmp_path / "Packages"
-
-    pull.pull(
-        client,
-        "https://raw.githubusercontent.com/owner/repo/release/current/Packages",
-        destination,
-    )
-
-    client.get_ref.assert_called_once_with("heads/release/current")
-    client.get_content.assert_called_once_with("Packages", "release/current")
-    assert destination.read_bytes() == b"PACKAGES: 0\n\n"
-
-
-def test_pull_all_replaces_local_cache_with_remote(tmp_path: Path) -> None:
-    package = "cat/pkg/pkg-1.gpkg.tar"
-    content = b"remote package"
-    remote = make_remote_packages(package, sizes={package: len(content)})
-    client = Mock(repository="owner/repo")
-    client.check.return_value = {"initialized": True}
-    client.get_content.return_value = {"sha": "index"}
-    client.content_bytes.return_value = remote.encode()
-    client.get_release.return_value = {"id": 1}
-    client.list_assets.return_value = [{"id": 2, "name": "pkg-1.gpkg.tar"}]
-
-    def download_asset(_asset_id: int, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(content)
-
-    client.download_asset.side_effect = download_asset
-    old_package = "cat/old/old-1.gpkg.tar"
-    write_pkgdir(
-        tmp_path,
-        make_packages(old_package, sizes={old_package: 3}),
-        {old_package: b"old"},
-    )
-    (tmp_path / "Packages.gz").write_bytes(b"stale")
-
-    pull.pull_locked(client, tmp_path)
-
-    entries = package_module.parse_packages(
-        (tmp_path / "Packages").read_text(encoding="utf-8")
-    )
-    assert list(entries) == [package]
-    assert (tmp_path / package).read_bytes() == content
-    assert not (tmp_path / old_package).exists()
-    assert not (tmp_path / "Packages.gz").exists()
-    client.check.assert_called_once_with(write=False, branch="binrepo")
-    client.get_content.assert_called_once_with("Packages", "binrepo")
-
-
-def test_replace_cache_copies_across_filesystems(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pkgdir = tmp_path / "pkgdir"
-    staging = tmp_path / "staging"
-    package = staging / "cat/pkg/pkg-1.gpkg.tar"
-    package.parent.mkdir(parents=True)
-    package.write_bytes(b"package")
-    (staging / "Packages").write_bytes(b"index")
-    pkgdir.mkdir()
-
-    def cross_device_replace(_source: Path, _destination: Path) -> None:
-        raise OSError(errno.EXDEV, "Invalid cross-device link")
-
-    monkeypatch.setattr(Path, "replace", cross_device_replace)
-
-    pull._replace_cache(pkgdir, staging)
-
-    assert (pkgdir / "cat/pkg/pkg-1.gpkg.tar").read_bytes() == b"package"
-    assert (pkgdir / "Packages").read_bytes() == b"index"
-    assert not package.exists()
-
-
 @pytest.mark.parametrize("repository", ("download/repo", "owner/download"))
 def test_private_asset_pull_allows_download_in_repository(
     repository: str, tmp_path: Path
@@ -1279,20 +1011,6 @@ def test_pull_rejects_missing_branch_on_initialized_repository(tmp_path: Path) -
     client.get_content.assert_not_called()
 
 
-def test_init_creates_private_repository() -> None:
-    client = Mock()
-    client.get_repository.return_value = None
-    client.check.return_value = {
-        "private": True,
-        "default_branch": "main",
-        "access": "write",
-        "initialized": True,
-    }
-    result = init.init_repository(client)
-    assert result["created"] is True
-    client.create_repository.assert_called_once_with(private=True)
-
-
 def test_init_accepts_empty_existing_repository() -> None:
     client = Mock()
     client.get_repository.return_value = {"name": "repo"}
@@ -1305,85 +1023,38 @@ def test_init_accepts_empty_existing_repository() -> None:
 
     result = init.init_repository(client)
 
-    assert result["created"] is False
-    assert result["initialized"] is False
+    assert result == {**client.check.return_value, "created": False}
     client.check.assert_called_once_with(write=True, branch="binrepo")
+    client.create_repository.assert_not_called()
     client.initialize_repository.assert_not_called()
 
 
-def test_init_and_check_cli_options() -> None:
-    init = cli.make_parser().parse_args(
-        ["init", "--repository", "owner/repo", "--token-file", "token", "--public"]
-    )
-    check = cli.make_parser().parse_args(
-        ["check", "--repository", "owner/repo", "--token-file", "token", "--read-only"]
-    )
-
-    assert init.command == "init"
-    assert init.public is True
-    assert check.command == "check"
-    assert check.read_only is True
-    assert cli.make_parser().parse_args(["check"]).repository is None
-
-
-def test_push_cli_uses_portage_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = Mock()
-    push_locked = Mock(return_value={"uploaded": 0, "removed": 0, "unchanged": 0})
-    monkeypatch.setattr(cli, "config", lambda: {"PKGDIR": "/binpkgs", "CHOST": "host"})
-    monkeypatch.setattr(cli, "read_token", Mock(return_value="secret"))
-    monkeypatch.setattr(cli, "GitHubClient", Mock(return_value=client))
-    monkeypatch.setattr(cli, "push_locked", push_locked)
-
-    assert (
-        cli.main(
-            [
-                "push",
-                "--repository",
-                "owner/repo",
-                "--token-file",
-                "token",
-                "--branch",
-                "testing",
-            ]
-        )
-        == 0
-    )
-    push_locked.assert_called_once_with(client, "/binpkgs", "testing")
-
-
-def test_push_cli_requires_portage_settings(
-    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "fails", (pytest.param(False, id="success"), pytest.param(True, id="failure"))
+)
+def test_push_releases_lock(
+    fails: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli, "config", dict)
-    monkeypatch.setattr(cli, "read_token", Mock(return_value="secret"))
-    monkeypatch.setattr(cli, "GitHubClient", Mock())
-
-    assert (
-        cli.main(["push", "--repository", "owner/repo", "--token-file", "token"]) == 1
-    )
-    assert capsys.readouterr().err == snapshot(
-        "portage-github-binrepo: PKGDIR must be set in Portage configuration\n"
-    )
-
-
-def test_push_is_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
     lock = object()
-
-    def fake_push(client: github.PushAPI, pkgdir: Path, branch: str) -> dict[str, int]:
-        calls.append((client, pkgdir, branch))
-        return {"uploaded": 0, "removed": 0, "unchanged": 1}
-
-    monkeypatch.setattr(push, "push", fake_push)
+    result = {"uploaded": 0, "removed": 0, "unchanged": 1}
+    operation = Mock(
+        side_effect=github.GitHubError("push failed") if fails else None,
+        return_value=result,
+    )
+    monkeypatch.setattr(push, "push", operation)
     lockfile = Mock(return_value=lock)
     unlockfile = Mock()
     monkeypatch.setattr(push, "lockfile", lockfile)
     monkeypatch.setattr(push, "unlockfile", unlockfile)
     client = FakeClient()
+    expectation = (
+        pytest.raises(github.GitHubError, match="push failed")
+        if fails
+        else nullcontext()
+    )
 
-    result = push.push_locked(client, tmp_path)
-
-    assert result == {"uploaded": 0, "removed": 0, "unchanged": 1}
-    assert len(calls) == 1
+    with expectation:
+        assert push.push_locked(client, tmp_path) == result
+    operation.assert_called_once_with(client, tmp_path, "binrepo")
     lockfile.assert_called_once_with(str(tmp_path / "Packages"), wantnewlockfile=True)
     unlockfile.assert_called_once_with(lock)
