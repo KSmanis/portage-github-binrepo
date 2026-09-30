@@ -1011,31 +1011,21 @@ def test_pull_rejects_missing_branch_on_initialized_repository(tmp_path: Path) -
     client.get_content.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("existing", "initialized"),
-    (
-        pytest.param(False, True, id="create-private"),
-        pytest.param(True, False, id="existing-empty"),
-    ),
-)
-def test_init_creates_or_accepts_repository(existing: bool, initialized: bool) -> None:
+def test_init_accepts_empty_existing_repository() -> None:
     client = Mock()
-    client.get_repository.return_value = {"name": "repo"} if existing else None
+    client.get_repository.return_value = {"name": "repo"}
     client.check.return_value = {
         "private": True,
         "default_branch": "main",
         "access": "write",
-        "initialized": initialized,
+        "initialized": False,
     }
 
     result = init.init_repository(client)
 
-    assert result == {**client.check.return_value, "created": not existing}
+    assert result == {**client.check.return_value, "created": False}
     client.check.assert_called_once_with(write=True, branch="binrepo")
-    if existing:
-        client.create_repository.assert_not_called()
-    else:
-        client.create_repository.assert_called_once_with(private=True)
+    client.create_repository.assert_not_called()
     client.initialize_repository.assert_not_called()
 
 

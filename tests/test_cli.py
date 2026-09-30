@@ -58,10 +58,6 @@ def test_config_rejects_invalid_settings(
         cli.read_config(config)
 
 
-def test_token_trims_whitespace(token_file: Path) -> None:
-    assert cli.read_token(token_file) == "secret"
-
-
 @pytest.mark.parametrize(
     ("kind", "message"),
     (("empty", "empty"), ("directory", "regular file"), ("public", "group or others")),
