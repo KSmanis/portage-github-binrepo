@@ -27,20 +27,26 @@ from portage_github_binrepo.package import release_coordinates
 from portage_github_binrepo.package import validate_branch
 
 if TYPE_CHECKING:
+    from typing import Final
+
     from portage_github_binrepo.github import PullAPI
+
+GITHUB_HOST: Final = "github.com"
+RAW_GITHUB_HOST: Final = "raw.githubusercontent.com"
+COMPRESSED_INDEX_NAME: Final = "Packages.gz"
 
 
 def write_empty_index(uri: str, destination: str | Path) -> bool:
     parsed = urlparse(uri)
     parts = [unquote(part) for part in parsed.path.split("/") if part]
     if (
-        parsed.hostname != "raw.githubusercontent.com"
+        parsed.hostname != RAW_GITHUB_HOST
         or len(parts) < 4
-        or parts[-1] not in {"Packages", "Packages.gz"}
+        or parts[-1] not in {"Packages", COMPRESSED_INDEX_NAME}
     ):
         return False
     data = make_empty_packages().encode()
-    if parts[-1] == "Packages.gz":
+    if parts[-1] == COMPRESSED_INDEX_NAME:
         data = gzip.compress(data, mtime=0)
     write_stream(Path(destination), [data])
     return True
@@ -51,10 +57,10 @@ def pull(
 ) -> None:
     parsed = urlparse(uri)
     parts = [unquote(part) for part in parsed.path.split("/") if part]
-    if parsed.hostname == "raw.githubusercontent.com" and len(parts) >= 4:
+    if parsed.hostname == RAW_GITHUB_HOST and len(parts) >= 4:
         _pull_index(client, uri, destination, parts)
         return
-    if parsed.hostname != "github.com" or len(parts) < 7:
+    if parsed.hostname != GITHUB_HOST or len(parts) < 7:
         raise ValueError("unsupported binrepo URI")  # noqa: TRY003
     if parts[2:4] != ["releases", "download"] or (
         f"{parts[0]}/{parts[1]}" != client.repository
@@ -80,7 +86,7 @@ def _pull_index(
     branch = validate_branch("/".join(parts[2:-1]))
     if f"{owner}/{repo}" != client.repository or parts[-1] not in {
         "Packages",
-        "Packages.gz",
+        COMPRESSED_INDEX_NAME,
     }:
         raise ValueError("index URI does not match configured repository")  # noqa: TRY003
     if not client.get_ref(f"heads/{branch}"):
@@ -92,7 +98,7 @@ def _pull_index(
     if not content:
         raise GitHubError(f"Packages was not found on branch {branch}")  # noqa: TRY003
     data = client.content_bytes(content)
-    if parts[-1] == "Packages.gz":
+    if parts[-1] == COMPRESSED_INDEX_NAME:
         data = gzip.compress(data, mtime=0)
     write_stream(Path(destination), [data])
 
@@ -170,10 +176,7 @@ def _replace_cache(pkgdir: Path, staging: Path) -> None:
 def repository_from_uri(uri: str) -> str:
     parsed = urlparse(uri)
     parts = [unquote(part) for part in parsed.path.split("/") if part]
-    if (
-        parsed.hostname not in {"github.com", "raw.githubusercontent.com"}
-        or len(parts) < 2
-    ):
+    if parsed.hostname not in {GITHUB_HOST, RAW_GITHUB_HOST} or len(parts) < 2:
         raise ValueError("unsupported binrepo URI")  # noqa: TRY003
     return f"{parts[0]}/{parts[1]}"
 
@@ -182,7 +185,7 @@ def cached_packages_path(uri: str, eroot: str | Path) -> Path:
     parsed = urlparse(uri)
     parts = [unquote(part) for part in parsed.path.split("/") if part]
     if (
-        parsed.hostname != "github.com"
+        parsed.hostname != GITHUB_HOST
         or len(parts) < 7
         or parts[2:4] != ["releases", "download"]
     ):
@@ -194,7 +197,7 @@ def cached_packages_path(uri: str, eroot: str | Path) -> Path:
         Path(eroot)
         / CACHE_PATH
         / "binhost"
-        / "raw.githubusercontent.com"
+        / RAW_GITHUB_HOST
         / parts[0]
         / parts[1]
         / Path(*branch)
