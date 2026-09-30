@@ -151,7 +151,8 @@ def pull_locked(
 
 def _replace_cache(pkgdir: Path, staging: Path) -> None:
     pkgdir.mkdir(parents=True, exist_ok=True)
-    for retained in pkgdir.glob(".binrepo-backup-*"):
+    backup_prefix = f".{pkgdir.name}.binrepo-backup-"
+    for retained in pkgdir.parent.glob(f"{backup_prefix}*"):
         raise FileExistsError(  # noqa: TRY003
             f"Recover retained cache backup before pulling: {retained}"
         )
@@ -161,7 +162,7 @@ def _replace_cache(pkgdir: Path, staging: Path) -> None:
         if (path.is_symlink() or path.is_file())
         and not path.name.endswith(".portage_lockfile")
     ]
-    backup = Path(tempfile.mkdtemp(dir=pkgdir, prefix=".binrepo-backup-"))
+    backup = Path(tempfile.mkdtemp(dir=pkgdir.parent, prefix=backup_prefix))
     saved: list[Path] = []
     installed: list[Path] = []
     try:
@@ -179,27 +180,33 @@ def _replace_cache(pkgdir: Path, staging: Path) -> None:
     except BaseException:
         try:
             for destination in reversed(installed):
+                # A failed rename may have collided with an existing directory.
+                if destination.is_dir() and not destination.is_symlink():
+                    continue
                 destination.unlink(missing_ok=True)
-            _remove_empty_cache_directories(pkgdir, exclude=backup)
+            _remove_empty_cache_directories(pkgdir)
             for relative in saved:
                 _move_cache_file(backup / relative, pkgdir / relative)
         except BaseException as error:
-            error.add_note(f"Cache backup retained at {backup}")
-            raise
+            raise OSError(  # noqa: TRY003
+                f"Cache restoration failed; backup retained at {backup}: {error}"
+            ) from error
         shutil.rmtree(backup)
         raise
-    shutil.rmtree(backup)
+    try:
+        shutil.rmtree(backup)
+    except OSError as error:
+        raise OSError(  # noqa: TRY003
+            f"New cache installed, but backup cleanup failed at {backup}; "
+            f"remove the retained backup before retrying: {error}"
+        ) from error
     _remove_empty_cache_directories(pkgdir)
 
 
-def _remove_empty_cache_directories(
-    pkgdir: Path, *, exclude: Path | None = None
-) -> None:
+def _remove_empty_cache_directories(pkgdir: Path) -> None:
     for path in sorted(
         pkgdir.rglob("*"), key=lambda item: len(item.parts), reverse=True
     ):
-        if path == exclude or exclude in path.parents:
-            continue
         if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
             path.rmdir()
 
