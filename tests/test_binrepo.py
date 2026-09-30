@@ -1,12 +1,12 @@
+from __future__ import annotations
+
 import base64
 import errno
 import gzip
 import hashlib
-from collections.abc import Iterator
-from collections.abc import Mapping
 from io import StringIO
 from pathlib import Path
-from typing import Never
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
@@ -20,6 +20,11 @@ from portage_github_binrepo import init
 from portage_github_binrepo import package as package_module
 from portage_github_binrepo import pull
 from portage_github_binrepo import push
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+    from typing import Never
 
 Asset = github.Asset
 Release = github.Release

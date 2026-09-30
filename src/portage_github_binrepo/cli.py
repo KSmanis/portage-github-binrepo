@@ -1,5 +1,7 @@
 """Push and pull a Portage binrepo backed by GitHub Releases."""
 
+from __future__ import annotations
+
 import argparse
 import shlex
 import stat

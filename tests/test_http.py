@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import base64
 import json
-from collections.abc import Iterator
-from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
@@ -11,6 +12,10 @@ from inline_snapshot import snapshot
 from portage import getbinpkg
 
 from portage_github_binrepo import github
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
 
 API = "https://api.github.com"
 

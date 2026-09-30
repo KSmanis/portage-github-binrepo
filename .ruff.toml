@@ -47,6 +47,7 @@ strict = true
 
 [lint.isort]
 force-single-line = true
+required-imports = ["from __future__ import annotations"]
 
 [lint.per-file-ignores]
 "**/__init__.py" = ["TID252"]

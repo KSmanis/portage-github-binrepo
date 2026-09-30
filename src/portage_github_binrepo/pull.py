@@ -1,10 +1,13 @@
 """Pull binrepo indexes and assets from GitHub."""
 
+from __future__ import annotations
+
 import errno
 import gzip
 import shutil
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import unquote
 from urllib.parse import urlparse
 
@@ -14,7 +17,6 @@ from portage.locks import unlockfile
 
 from portage_github_binrepo.github import BINREPO_BRANCH
 from portage_github_binrepo.github import GitHubError
-from portage_github_binrepo.github import PullAPI
 from portage_github_binrepo.github import write_stream
 from portage_github_binrepo.package import _restore_package_paths
 from portage_github_binrepo.package import asset_id
@@ -23,6 +25,9 @@ from portage_github_binrepo.package import make_empty_packages
 from portage_github_binrepo.package import parse_packages
 from portage_github_binrepo.package import release_coordinates
 from portage_github_binrepo.package import validate_branch
+
+if TYPE_CHECKING:
+    from portage_github_binrepo.github import PullAPI
 
 
 def write_empty_index(uri: str, destination: str | Path) -> bool:
