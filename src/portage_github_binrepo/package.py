@@ -16,7 +16,6 @@ from portage.versions import catpkgsplit
 
 if TYPE_CHECKING:
     from collections.abc import Collection
-    from collections.abc import Iterable
     from collections.abc import Mapping
 
 CLEANUP_FIELD = "PGB-CLEANUP"
@@ -114,7 +113,7 @@ def parse_packages(text: str) -> dict[str, dict[str, str]]:
 
 
 def with_remote_uri(
-    text: str, repository: str, cleanup: Iterable[tuple[int, int, str]] = ()
+    text: str, repository: str, cleanup: Collection[tuple[int, int, str]] = ()
 ) -> str:
     index = _read_index(text)
     index.header["URI"] = f"https://github.com/{repository}/releases/download"
